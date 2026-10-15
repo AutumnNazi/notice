@@ -1,0 +1,26 @@
+# 构建产物
+build/
+dist/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# 用户本地数据（含真实提醒内容，不上传）
+data/tasks.json
+data/settings.json
+
+# 运行期生成的图标（由 core/icon_assets.py 的 ensure_icon_assets() 生成）
+data/app_icon*.png
+data/app_icon.ico
+data/tray_icon.png
+data/toast_image.png
+
+# 开发过程截图
+ui_*.png
+
+# 已被 core/live_info.py 与 tests/ 取代的过程草稿
+work/
