@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import logging
+import logging.handlers
+import re
+import sys
+import unittest
+from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import config
+from core import app_logging
+
+
+class AppLoggingTests(unittest.TestCase):
+    """core/app_logging.py 的日志落地、轮转参数、幂等与降级行为测试。
+
+    全部用临时目录，避免污染程序同级的真实 data/。
+    """
+
+    def setUp(self):
+        self._temp = TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.log_dir = Path(self._temp.name) / "logs"
+        self._root_level = logging.getLogger().level
+        self.addCleanup(self._release_root_logger)
+
+    def _release_root_logger(self):
+        """撤销本测试装的 handler 与级别，避免影响同进程内其它测试模块。"""
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            if handler.get_name() in (app_logging.FILE_HANDLER_NAME, app_logging.FALLBACK_HANDLER_NAME):
+                root.removeHandler(handler)
+                handler.close()
+        root.setLevel(self._root_level)
+
+    def test_log_is_written_to_target_file_without_mojibake(self):
+        app_logging.setup_logging(self.log_dir)
+        app_logging.get_logger("core.live_info").warning("天气获取失败：设备定位不可用")
+
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn("天气获取失败：设备定位不可用", content)
+        self.assertIn("[WARNING]", content)
+        self.assertIn("core.live_info", content)
+        match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", content)
+        self.assertIsNotNone(match, content)
+        # 时间戳来自本机本地时间（项目约定北京时间 UTC+8），未引入时区库
+        logged_at = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+        self.assertLess(abs((datetime.now() - logged_at).total_seconds()), 60)
+
+    def test_file_handler_rotates_with_agreed_limits(self):
+        root = app_logging.setup_logging(self.log_dir)
+        handlers = [h for h in root.handlers if h.get_name() == app_logging.FILE_HANDLER_NAME]
+        self.assertEqual(len(handlers), 1)
+        handler = handlers[0]
+        self.assertIsInstance(handler, logging.handlers.RotatingFileHandler)
+        self.assertEqual(handler.maxBytes, 1024 * 1024)
+        self.assertEqual(handler.backupCount, 3)
+        self.assertEqual(handler.encoding, "utf-8")
+        self.assertEqual(Path(handler.baseFilename), self.log_dir / app_logging.LOG_FILE_NAME)
+
+    def test_repeated_setup_keeps_one_handler_and_one_record(self):
+        app_logging.setup_logging(self.log_dir)
+        root = app_logging.setup_logging(self.log_dir)
+        app_logging.setup_logging(self.log_dir)
+
+        ours = [h for h in root.handlers if h.get_name() == app_logging.FILE_HANDLER_NAME]
+        self.assertEqual(len(ours), 1, "重复调用不应重复添加 handler")
+
+        app_logging.get_logger("core.live_info").warning("同一条失败只应写一次")
+        lines = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len([line for line in lines if "同一条失败只应写一次" in line]), 1)
+
+    def test_default_dir_comes_from_config_at_call_time(self):
+        with patch.object(config, "LOG_DIR", self.log_dir):
+            app_logging.setup_logging()
+        self.assertTrue((self.log_dir / app_logging.LOG_FILE_NAME).exists())
+
+    def test_unwritable_dir_falls_back_to_stderr_without_raising(self):
+        buffer = io.StringIO()
+        with patch.object(app_logging.Path, "mkdir", side_effect=OSError("只读目录")), \
+             contextlib.redirect_stderr(buffer):
+            root = app_logging.setup_logging(self.log_dir)
+
+            names = [handler.get_name() for handler in root.handlers]
+            self.assertIn(app_logging.FALLBACK_HANDLER_NAME, names)
+            self.assertNotIn(app_logging.FILE_HANDLER_NAME, names)
+            self.assertFalse((self.log_dir / app_logging.LOG_FILE_NAME).exists())
+
+        app_logging.get_logger("core.live_info").warning("降级后仍要能记录")
+        self.assertIn("降级后仍要能记录", buffer.getvalue())
+
+    def test_file_open_failure_falls_back_to_stderr(self):
+        with patch.object(app_logging.logging.handlers, "RotatingFileHandler",
+                          side_effect=OSError("没有写权限")):
+            root = app_logging.setup_logging(self.log_dir)
+
+        names = [handler.get_name() for handler in root.handlers]
+        self.assertIn(app_logging.FALLBACK_HANDLER_NAME, names)
+        self.assertNotIn(app_logging.FILE_HANDLER_NAME, names)
+
+    def test_uncaught_exception_is_logged_once_and_chained(self):
+        calls = []
+        self.addCleanup(setattr, app_logging, "_original_excepthook", None)
+        self.addCleanup(setattr, sys, "excepthook", sys.excepthook)
+        app_logging._original_excepthook = None  # 重置包装状态，保证用例可重复执行
+        sys.excepthook = lambda *args: calls.append(args)
+
+        app_logging.install_excepthook()
+        wrapper = sys.excepthook
+        app_logging.install_excepthook()
+        self.assertIs(sys.excepthook, wrapper, "重复调用不应叠加包装")
+
+        with self.assertLogs(app_logging.UNCAUGHT_LOGGER_NAME, level="CRITICAL") as captured:
+            try:
+                raise ValueError("启动阶段崩溃")
+            except ValueError:
+                sys.excepthook(*sys.exc_info())
+
+        self.assertIn("未捕获异常导致退出", captured.output[0])
+        self.assertIn("启动阶段崩溃", captured.output[0])
+        self.assertEqual(len(calls), 1, "原有 excepthook 必须仍被调用")
+        self.assertIs(calls[0][0], ValueError)
+
+
+if __name__ == "__main__":
+    unittest.main()

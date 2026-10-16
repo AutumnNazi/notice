@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -157,8 +158,29 @@ class LiveInfoUITests(unittest.TestCase):
     def test_lunar_failure_retries_and_recovers_on_the_same_day(self):
         self.assertTrue(self.wait_for(lambda: self.app.lunar_var.get() == "九月初五"))
         self.app._lunar_day = None
+        # lunar_date 是在后台取数线程里调的，而时钟链与本次手动刷新都可能同时发起取数，
+        # 用 side_effect 固定「第一次失败、第二次成功」会变成两个线程抢序列的抛硬币：
+        # 谁先拿到成功都不确定，序列耗尽还会让后一次取数抛 StopIteration 而一直停在失败态。
+        # 这里改成加锁计数：无论哪个线程先调，首次必失败、其后必成功，语义不变但结果确定。
+        calls_lock = threading.Lock()
+        calls = 0
+
+        def sometimes_failing_lunar(_day):
+            nonlocal calls
+            with calls_lock:
+                first = calls == 0
+                calls += 1
+            if first:
+                raise OSError("日历暂不可用")
+            return ("九月初五", "丙午年  马年")
+
         with patch.object(app_module, "LUNAR_RETRY_SECONDS", 0.1), \
-             patch.object(app_module, "lunar_date", side_effect=[OSError("日历暂不可用"), ("九月初五", "丙午年  马年")]):
+             patch.object(app_module, "lunar_date", side_effect=sometimes_failing_lunar):
+            # 本用例针对「失败后当天重试并恢复」，不是调度守卫的重试节流；上一拍时钟可能刚
+            # 发起过一次取数或刚写过退避时间，手动刷新会被守卫跳过而看不到失败态。这里显式
+            # 复位守卫条件，让这次刷新必然发起取数。
+            self.app._lunar_pending = None
+            self.app._lunar_retry_at = 0.0
             self.app._refresh_clock()
             self.assertTrue(self.wait_for(lambda: "失败" in self.app.lunar_var.get()))
             self.assertTrue(self.wait_for(lambda: self.app.lunar_var.get() == "九月初五"))
@@ -486,6 +508,24 @@ class LiveInfoUITests(unittest.TestCase):
         quote_right = self.app.quote_label.winfo_rootx() + self.app.quote_label.winfo_width()
         season_left = self.app.season_card.winfo_rootx()
         self.assertLessEqual(quote_right, season_left, "名言右缘越过了时间天气卡左缘")
+
+    def test_dpi_change_rebuilds_ui_at_new_scale(self):
+        # 运行期 DPI 变化回归：显示缩放变化后按新 DPI 重建界面，内容与窗口不脱节。
+        changed_dpi = 96 if self.app._last_dpi != 96 else 144
+        old_card = self.app.season_card
+        with patch.object(self.app, "_current_window_dpi", return_value=changed_dpi):
+            self.app._on_root_configure(SimpleNamespace(widget=self.app.root))
+        self.assertEqual(self.app.ui_scale, max(changed_dpi / 96.0, 1.0))
+        self.assertEqual(self.app._last_dpi, changed_dpi)
+        self.assertIsNot(self.app.season_card, old_card)
+        self.assertIsNotNone(self.app.panel_content)
+
+    def test_same_dpi_configure_does_not_rebuild(self):
+        # DPI 没变时（如普通拖动改变窗口大小）不应触发重建。
+        old_card = self.app.season_card
+        with patch.object(self.app, "_current_window_dpi", return_value=self.app._last_dpi):
+            self.app._on_root_configure(SimpleNamespace(widget=self.app.root))
+        self.assertIs(self.app.season_card, old_card)
 
     def test_narrow_content_stacks_season_card_below_quote(self):
         # 内容区过窄时时间天气卡移到名言下方（堆叠），恢复宽度后回到并排。

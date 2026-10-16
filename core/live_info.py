@@ -7,7 +7,6 @@ Windows 自带的中国农历日历，两者都不引入第三方依赖。
 from __future__ import annotations
 
 import json
-import logging
 import math
 import os
 import subprocess
@@ -17,6 +16,10 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from core.app_logging import get_logger
+
+
+_LOGGER = get_logger(__name__)
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 LOCATION_URL = "https://ipwho.is/"
@@ -51,24 +54,50 @@ class Weather:
 
 
 def _powershell_json(script: str, timeout: int = 12) -> dict:
-    result = subprocess.run(
-        [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command",
-         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-         "$ErrorActionPreference = 'Stop'; " + script],
-        capture_output=True, encoding="utf-8", errors="strict", timeout=timeout,
-        check=True, creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    data = json.loads(result.stdout.lstrip("\ufeff"))
+    try:
+        result = subprocess.run(
+            [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+             "$ErrorActionPreference = 'Stop'; " + script],
+            capture_output=True, encoding="utf-8", errors="strict", timeout=timeout,
+            check=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # 记录超时与异常类型：用于区分 PowerShell 缺失、被策略拦截还是脚本卡死
+        _LOGGER.warning("调用系统 PowerShell 失败（超时 %ss）：%s: %s",
+                        timeout, type(exc).__name__, exc, exc_info=True)
+        raise
+    try:
+        data = json.loads(result.stdout.lstrip("\ufeff"))
+    except ValueError as exc:
+        # 保留输出片段，才能看出是编码问题还是脚本自身报错
+        _LOGGER.warning("PowerShell 返回内容无法解析：%s: %s；原始输出=%r",
+                        type(exc).__name__, exc, result.stdout[:200])
+        raise
     if not isinstance(data, dict):
+        _LOGGER.warning("PowerShell 返回了非对象 JSON：%r", data)
         raise ValueError("系统返回的数据格式无效")
     return data
 
 
 def _read_json(url: str) -> dict:
     request = Request(url, headers={"User-Agent": "ShiChenFa/1.0", "Accept": "application/json"})
-    with urlopen(request, timeout=NETWORK_TIMEOUT_SECONDS) as response:
-        data = json.loads(response.read(1_000_001).decode("utf-8-sig"))
+    try:
+        with urlopen(request, timeout=NETWORK_TIMEOUT_SECONDS) as response:
+            body = response.read(1_000_001)
+    except OSError as exc:
+        # HTTPError 是 URLError 子类，状态码在 code 上；带上 URL 才能区分是定位还是天气失败
+        _LOGGER.warning("网络请求失败：url=%s 状态码=%s %s: %s",
+                        url, getattr(exc, "code", "-"), type(exc).__name__, exc, exc_info=True)
+        raise
+    try:
+        data = json.loads(body.decode("utf-8-sig"))
+    except ValueError as exc:
+        _LOGGER.warning("服务返回内容无法解析：url=%s %s: %s；原始内容=%r",
+                        url, type(exc).__name__, exc, body[:200])
+        raise
     if not isinstance(data, dict):
+        _LOGGER.warning("服务返回了非对象 JSON：url=%s 类型=%s", url, type(data).__name__)
         raise ValueError("服务返回的数据格式无效")
     return data
 
@@ -99,9 +128,12 @@ try {
         longitude = _coordinate(position.get("longitude"), 180)
         location, source = "当前位置", "设备定位"
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        logging.getLogger(__name__).info("设备定位不可用，改用 IP 近似定位：%s", exc)
+        # 降级路径：记录异常类型与原因，便于判断是位置权限、服务缺失还是系统报错
+        _LOGGER.warning("设备定位不可用，改用 IP 近似定位：%s: %s", type(exc).__name__, exc)
         position = _read_json(LOCATION_URL)
         if position.get("success") is not True:
+            _LOGGER.warning("IP 定位服务未返回成功结果：url=%s 提示=%s",
+                            LOCATION_URL, position.get("message") or "-")
             raise ValueError("自动定位失败，请检查网络或位置权限")
         latitude = _coordinate(position.get("latitude"), 90)
         longitude = _coordinate(position.get("longitude"), 180)
@@ -115,20 +147,28 @@ try {
     payload = _read_json(f"{WEATHER_URL}?{query}")
     current = payload.get("current")
     if not isinstance(current, dict):
+        _LOGGER.warning("天气服务未返回当前天气：url=%s 顶层字段=%s",
+                        WEATHER_URL, sorted(payload.keys()))
         raise ValueError("天气服务未返回当前天气")
     temperature = current.get("temperature_2m")
     stamp = current.get("time")
     if any(isinstance(value, bool) or not isinstance(value, (int, float))
            or not math.isfinite(value) for value in (temperature, stamp)):
+        _LOGGER.warning("天气服务返回了无效的温度或时间：温度=%r 时间=%r", temperature, stamp)
         raise ValueError("天气服务返回了无效的温度或时间")
     code = current.get("weather_code")
     if isinstance(code, bool) or not isinstance(code, int) or code not in WEATHER_CODES:
+        _LOGGER.warning("天气服务返回了未知天气类型：code=%r", code)
         raise ValueError("天气服务返回了未知天气类型")
     if payload.get("current_units", {}).get("temperature_2m") != "°C":
+        _LOGGER.warning("天气服务返回了不支持的温度单位：current_units=%r",
+                        payload.get("current_units"))
         raise ValueError("天气服务返回了不支持的温度单位")
     observed = datetime.fromtimestamp(stamp, timezone.utc)
     age = (datetime.now(timezone.utc) - observed).total_seconds()
     if not -300 <= age <= WEATHER_MAX_AGE_SECONDS:
+        _LOGGER.warning("天气服务返回的数据已过期：观测时间=%s 距今=%.0f 秒",
+                        observed.astimezone().strftime("%Y-%m-%d %H:%M:%S"), age)
         raise ValueError("天气服务返回的数据已过期")
     return Weather(location, source, float(temperature), WEATHER_CODES[code], observed)
 
@@ -144,6 +184,7 @@ $year = $calendar.GetYear($day);
 """ % day.isoformat())
     month, lunar_day, leap, cycle = (int(data[key]) for key in ("month", "day", "leap", "cycle"))
     if not (1 <= month <= 13 and 1 <= lunar_day <= 30 and 0 <= leap <= 13 and 1 <= cycle <= 60):
+        _LOGGER.warning("系统农历数据无效：日期=%s 返回值=%s", day.isoformat(), data)
         raise ValueError("系统农历数据无效")
     is_leap = leap > 0 and month == leap
     if leap and month >= leap:

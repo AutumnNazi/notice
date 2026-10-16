@@ -157,6 +157,25 @@ data/app_icon.ico
 data/toast_image.png
 ```
 
+### 运行日志
+
+```text
+data/logs/notice.log
+```
+
+出问题时先看这里：警告与异常会带时间戳记进来，单个文件满 1 MB 自动轮转，最多保留 3 份。
+日志目录不可写时自动降级为只输出到控制台，不会因为写不了日志而影响使用。
+
+### 数据文件损坏时的副本
+
+```text
+data/tasks.json.corrupt-YYYYmmdd-HHMMSS
+data/settings.json.corrupt-YYYYmmdd-HHMMSS
+```
+
+数据文件整体读不动时（内容不是合法 JSON 等），程序会照常启动，并把坏的那份**原样复制**成
+上面这个名字留档，原文件本身不动，方便你自己翻回来找内容。同一份坏内容只留一份副本。
+
 ### Windows 通知快捷方式
 
 ```text
@@ -186,6 +205,7 @@ data/toast_image.png
 │   ├── models.py
 │   ├── scheduler.py
 │   ├── notifier.py
+│   ├── app_logging.py
 │   ├── icon_assets.py
 │   ├── font_manager.py
 │   ├── live_info.py
@@ -198,16 +218,25 @@ data/toast_image.png
 │   └── tray.py
 ├── tests/
 │   ├── test_live_info.py
+│   ├── test_store_resilience.py
+│   ├── test_app_logging.py
 │   └── test_ui_improvements.py
+├── pytest.ini
 └── requirements.txt
 ```
 
 ## 运行测试
 
-通知线程、调度配置、原子保存、天气与农历取数以及主界面实时信息均有回归测试：
+提醒线程、调度配置、原子保存、数据文件容错、日志落地、天气与农历取数以及主界面实时信息均有回归测试：
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+装了 pytest 也可以直接用（`pytest.ini` 已把收集范围限定在 `tests/`）：
+
+```bash
+python -m pytest -q
 ```
 
 ## 打包
@@ -238,6 +267,8 @@ dist/时辰筏/时辰筏.exe
 - 如果旧版本 `时辰筏.exe` 仍在运行，重新打包时可能无法直接覆盖，需要先退出旧进程。
 - 字体目录导入的是本机可用字体，目录里需要包含 `.ttf` 或 `.otf` 文件。
 - 过去时间的“单次提醒”不会继续调度，程序会自动视为过期。
+- 提醒数据里有读不通的内容时，程序不会打不开：那条提醒会保留下来并自动停用，界面上标成待修复，你改好触发条件再启用即可；同一份数据里其它正常的提醒不受影响。
+- 启动异常、取数失败这类问题会记进 `data/logs/notice.log`，反馈问题时附上这个文件最有用。
 
 ## 当前已知特点
 

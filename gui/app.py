@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import logging
+import os
 import queue
 import random
 import sys
@@ -55,6 +56,10 @@ class NoticeApp:
         self.root.font_family_var = None
         self.tasks = self.store.load_tasks()
         self.notifier = Notifier()
+        # 调度器的变更回调可能来自它的工作线程：那里只能投请求，界面刷新一律回主线程消费。
+        self._refresh_queue: queue.Queue = queue.Queue()
+        # 界面还没搭起来时到来的变更请求先挂起：此刻还没有卡片与空状态控件可刷。
+        self._ui_ready = False
         self.scheduler = TaskScheduler(self.notifier, on_change=self._schedule_refresh)
         self.scheduler.start()
         self.scheduler.sync_tasks(self.tasks)
@@ -95,6 +100,9 @@ class NoticeApp:
         self.scroll_frame: tk.Frame | None = None
         self.search_entry: tk.Entry | None = None
         self.filter_btn: tk.Label | None = None
+        # 两类菜单都只建一次、反复复用：每次弹出都新建会让 Tcl widget 随点击次数线性增长。
+        self._task_menu: tk.Menu | None = None
+        self._filter_menu: tk.Menu | None = None
         self.filter_type: str = "all"
         self.task_canvas: tk.Canvas | None = None
         self.shell: tk.Frame | None = None
@@ -127,6 +135,9 @@ class NoticeApp:
         self._set_random_quote()
         self._start_quote_rotation()
         self._maximize_window()
+        # 界面已就绪：此后的调度变更回调可以立刻刷新，挂起期间的请求在这里一并补上。
+        self._ui_ready = True
+        self._drain_refresh_requests()
         self._refresh_ui()
         self._refresh_clock()
         self._start_live_info()
@@ -135,12 +146,32 @@ class NoticeApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_requested)
         self.tray.start()
 
+        # [TEMP-DEBUG] 布局诊断，验证后删除
+        if os.environ.get("NOTICE_DEBUG_LAYOUT"):
+            self._debug_dump_count = 0
+            self._debug_dump_tick()
+
+    def _debug_dump_tick(self) -> None:
+        # [TEMP-DEBUG] 布局诊断，验证后删除
+        path = Path(os.environ["NOTICE_DEBUG_LAYOUT"])
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"tick={self._debug_dump_count} ui_scale={self.ui_scale} last_dpi={self._last_dpi} "
+                         f"root={self.root.winfo_width()}x{self.root.winfo_height()} "
+                         f"root_xy=({self.root.winfo_rootx()},{self.root.winfo_rooty()}) "
+                         f"fpixels={self.root.winfo_fpixels('1i'):.1f} "
+                         f"scaling={self.root.tk.call('tk', 'scaling')} "
+                         f"season={'None' if self.season_card is None else f'{self.season_card.winfo_rootx()},{self.season_card.winfo_rooty()} {self.season_card.winfo_width()}x{self.season_card.winfo_height()} mapped={self.season_card.winfo_ismapped()}'}\n")
+        self._debug_dump_count += 1
+        if self._debug_dump_count < 20:
+            self.root.after(1000, self._debug_dump_tick)
+
     def run(self) -> None:
         self.root.mainloop()
 
     def _configure_display_metrics(self) -> None:
         self.root.update_idletasks()
         dpi = self._detect_window_dpi()
+        self._last_dpi = dpi
         self.ui_scale = max(dpi / 96.0, 1.0)
         try:
             self.root.tk.call("tk", "scaling", dpi / 72.0)
@@ -175,23 +206,33 @@ class NoticeApp:
         return self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
     def _detect_window_dpi(self) -> int:
-        # 以主屏 DPI 为准：窗口刚创建时可能落在副屏，按窗口当前显示器取 DPI
-        # 会得到不一致的缩放；本应用的窗口始终布局在主屏工作区内。
-        try:
-            point = ctypes.wintypes.POINT(0, 0)
-            monitor = ctypes.windll.user32.MonitorFromPoint(point, 1)  # MONITOR_DEFAULTTOPRIMARY
-            if monitor:
-                dpi_x = ctypes.c_uint(0)
-                dpi_y = ctypes.c_uint(0)
-                if ctypes.windll.shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y)) == 0:
-                    return int(dpi_x.value)
-        except Exception:
-            pass
+        # 取窗口当前的实际 DPI：GetDpiForMonitor 的 MDT_DEFAULT 在多屏/缩放切换
+        # 环境下会返回过期值，只有窗口自身报告的 DPI 与系统缩放行为一致。
+        return self._current_window_dpi()
+
+    def _current_window_dpi(self) -> int:
         try:
             hwnd = self.root.winfo_id()
             return int(ctypes.windll.user32.GetDpiForWindow(hwnd))
         except Exception:
             return 96
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        # 显示缩放变化（改缩放、RDP 重连、跨屏拖动）时窗口像素会被系统重缩放，
+        # 而 ui_scale 还停留在启动值，内容会与窗口脱节。检测到变化就按新 DPI 重建。
+        if event.widget is not self.root:
+            return
+        dpi = self._current_window_dpi()
+        if dpi != self._last_dpi:
+            logging.getLogger(__name__).info("显示缩放变化，按新 DPI 重建界面：%s -> %s", self._last_dpi, dpi)
+            self._last_dpi = dpi
+            self.ui_scale = max(dpi / 96.0, 1.0)
+            self.root.ui_scale = self.ui_scale
+            try:
+                self.root.tk.call("tk", "scaling", dpi / 72.0)
+            except tk.TclError:
+                pass
+            self._rebuild_ui()
 
     def _configure_styles(self) -> None:
         apply_ttk_theme(self.style, self.font_family_var.get(), self.ui_scale)
@@ -223,6 +264,7 @@ class NoticeApp:
         shell.grid_columnconfigure(1, weight=1)
         shell.grid_rowconfigure(1, weight=1)
         shell.bind("<Configure>", self._resize_main_layout)
+        self.root.bind("<Configure>", self._on_root_configure)
 
         self._build_titlebar(shell)
         self._build_left_panel(shell)
@@ -287,7 +329,9 @@ class NoticeApp:
             icon_paths = [path for path in ICON_PNG_FILES if path.exists()]
             icon_paths.sort(key=lambda path: int(path.stem.rsplit("_", 1)[-1]), reverse=True)
             images = [
-                tk.PhotoImage(file=str(path))
+                # 必须显式绑定到本窗口的 root：不传 master 时图片会挂到进程默认解释器上，
+                # 同进程存在过别的 Tk 窗口时（测试连续建窗就是这种情形）图片名会失效。
+                tk.PhotoImage(master=self.root, file=str(path))
                 for path in icon_paths
             ]
             if images:
@@ -306,7 +350,7 @@ class NoticeApp:
             if not path.exists():
                 continue
             try:
-                image = tk.PhotoImage(file=str(path))
+                image = tk.PhotoImage(master=self.root, file=str(path))
             except tk.TclError:
                 continue
             self.tk_images.append(image)
@@ -813,8 +857,10 @@ class NoticeApp:
             self.summary_var.set(f"共 {len(self.tasks)} 条提醒")
         self.subtitle_var.set(f"{APP_NAME} · 静水深流，按时而渡")
         if self.pause_button:
+            # 按钮写“点下去会发生什么”，与托盘菜单的措辞保持一致；当前是运行还是暂停交给圆点颜色表达，
+            # 免得按钮写着状态、点下去却做相反的事。
             if self.scheduler.paused:
-                self.pause_button.set_text("全部暂停")
+                self.pause_button.set_text("恢复全部提醒")
                 self.pause_button.set_colors(
                     fill="#fbf3e6",
                     active_fill="#f7e8d0",
@@ -823,7 +869,7 @@ class NoticeApp:
                     dot_color="#d97706",
                 )
             else:
-                self.pause_button.set_text("全部运行")
+                self.pause_button.set_text("暂停全部提醒")
                 self.pause_button.set_colors(
                     fill="#fbf7f1",
                     active_fill="#eee2d3",
@@ -839,6 +885,12 @@ class NoticeApp:
             if filtered_tasks:
                 self.empty_label.place_forget()
             else:
+                # 区分“一条提醒都没有”和“有提醒但被筛选/搜索挡掉”：后者引导新建就南辕北辙了。
+                self.empty_label.configure(
+                    text="没有匹配的提醒。\n换个关键词或清除筛选条件。"
+                    if self.tasks
+                    else "还没有提醒。\n点左上角新建第一条。"
+                )
                 self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
         self.tray.refresh()
 
@@ -853,6 +905,7 @@ class NoticeApp:
             if self._display_day != now.date():
                 self._display_day = now.date()
                 self._refresh_ui()
+            self._drain_refresh_requests()
             self._drain_live_info()
             self._refresh_live_info(now)
         finally:
@@ -1181,7 +1234,7 @@ class NoticeApp:
         fit_width = max(1, canvas_width - scale(16, self.ui_scale))
         fit_height = max(1, canvas_height - scale(12, self.ui_scale))
         image.thumbnail((fit_width, fit_height), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(image)
+        photo = ImageTk.PhotoImage(image, master=self.root)
         self.tk_images.append(photo)
         canvas.delete("all")
         canvas.create_image(canvas_width // 2, canvas_height // 2, image=photo, anchor="center")
@@ -1199,7 +1252,8 @@ class NoticeApp:
     def _open_task_menu(self, task_id: str) -> None:
         self.selected_task_id = task_id
         task = self._selected_task()
-        menu = tk.Menu(self.root, tearoff=False)
+        menu = self._reusable_menu("_task_menu")
+        menu.delete(0, "end")
         menu.add_command(label="编辑", command=self.edit_selected_task)
         menu.add_command(label="停用提醒" if task and task.enabled else "启用提醒", command=self.toggle_selected_task)
         menu.add_command(label="删除", command=self.delete_selected_task)
@@ -1209,6 +1263,14 @@ class NoticeApp:
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+
+    def _reusable_menu(self, attribute: str) -> tk.Menu:
+        # 菜单复用同一个 Tcl widget：菜单项每次重填，窗口本身不重建，点多少次都不累积。
+        menu = getattr(self, attribute, None)
+        if menu is None or not menu.winfo_exists():
+            menu = tk.Menu(self.root, tearoff=False)
+            setattr(self, attribute, menu)
+        return menu
 
     def _edit_task_by_id(self, task_id: str) -> None:
         self.selected_task_id = task_id
@@ -1244,7 +1306,8 @@ class NoticeApp:
         ]
 
     def _open_filter_menu(self, widget: tk.Widget) -> None:
-        menu = tk.Menu(self.root, tearoff=False)
+        menu = self._reusable_menu("_filter_menu")
+        menu.delete(0, "end")
         options = [
             ("all", "全部提醒"),
             ("enabled", "仅显示启用"),
@@ -1363,7 +1426,25 @@ class NoticeApp:
             return f"下次：{task.next_run}"
 
     def _schedule_refresh(self) -> None:
-        self.root.after(0, self._sync_from_scheduler)
+        # Tkinter 只允许主线程调用，而调度器的这个回调会从它的工作线程进来。
+        # 主线程的调用（用户点暂停、新建、编辑、删除）立刻刷新，保证操作即时可见；
+        # 后台线程只留下一个刷新请求，交给每秒的时钟链回主线程执行。
+        if threading.current_thread() is threading.main_thread() and getattr(self, "_ui_ready", True):
+            self._sync_from_scheduler()
+            return
+        self._refresh_queue.put(True)
+
+    def _drain_refresh_requests(self) -> None:
+        # 一秒内可能累积多次变更（例如批量同步），合并成一次刷新，避免重复重建卡片。
+        pending = False
+        while True:
+            try:
+                self._refresh_queue.get_nowait()
+            except queue.Empty:
+                break
+            pending = True
+        if pending:
+            self._sync_from_scheduler()
 
     def _sync_from_scheduler(self) -> None:
         self._persist_tasks()

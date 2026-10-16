@@ -42,6 +42,12 @@ from single_instance import single_instance_guard, register_show_callback
 
 
 def main() -> None:
+    # 日志要在单实例校验之前就绪：--windowed 打包后控制台不可见，
+    # 启动阶段的异常只能靠 data/logs/notice.log 留痕。
+    from core.app_logging import install_excepthook, setup_logging
+
+    setup_logging()
+    install_excepthook()
     single_instance_guard()
     from gui.app import NoticeApp
 

@@ -29,3 +29,10 @@ ui_*.png
 
 # 已被 core/live_info.py 与 tests/ 取代的过程草稿
 work/
+
+# 运行日志：程序把启动与唤醒过程写到 data/logs/，属于本机运行痕迹
+data/logs/
+
+# store.py 读到损坏 JSON 时留档的副本（命名如 tasks.json.corrupt-20260213-101530），
+# 里面是用户尚未修复的原始内容，留档给本机排查但不入库
+data/*.corrupt-*

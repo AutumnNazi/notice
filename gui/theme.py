@@ -241,7 +241,8 @@ class PillButton(tk.Canvas):
             import tkinter.font as tkfont
             dot_r = max(2, int(round(3 * self.ui_scale)))
             gap = max(3, int(round(6 * self.ui_scale)))
-            font_obj = tkfont.Font(font=btn_font)
+            # 字体测量也绑定本控件所在的解释器：不指定 root 时会挂到进程默认解释器上。
+            font_obj = tkfont.Font(root=self, font=btn_font)
             text_w = font_obj.measure(self.text)
             total_w = dot_r * 2 + gap + text_w
             dot_x = max(dot_r + 2, (width - total_w) // 2 + dot_r)

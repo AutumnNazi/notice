@@ -15,6 +15,8 @@ if getattr(sys, "frozen", False):
 else:
     _BASE = Path(__file__).resolve().parent
 DATA_DIR = _BASE / "data"
+# 运行日志目录：--windowed 打包后没有控制台，出问题只能翻这里的文件
+LOG_DIR = DATA_DIR / "logs"
 TASKS_FILE = DATA_DIR / "tasks.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 ICON_FILE = DATA_DIR / "tray_icon.png"

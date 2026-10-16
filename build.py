@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 from core.icon_assets import ensure_icon_assets
@@ -19,6 +20,10 @@ ICON_PATH = ROOT / "data" / "app_icon.ico"
 PRESERVED_DATA = ROOT / "_dist_data_preserved"
 USER_DATA_FILES = {"tasks.json", "settings.json"}
 
+# 等旧实例释放产物锁：上限秒数与探测间隔，超时后仍继续打包但必须提示
+LOCK_TIMEOUT = 6.0
+LOCK_POLL_INTERVAL = 0.2
+
 EXCLUDE = [
     "numpy", "scipy", "pandas", "matplotlib",
     "sqlalchemy", "cryptography", "bcrypt", "psutil",
@@ -26,10 +31,41 @@ EXCLUDE = [
 ]
 
 
+def _is_locked(path: Path) -> bool:
+    """探测产物是否仍被进程占用。
+
+    以追加方式打开只做探测、不写内容，所以不会改动产物；Windows 上文件被运行中的进程占着时
+    这次打开会抛 PermissionError，就是「仍被占用」的信号。
+    """
+    if not path.exists():
+        return False
+    try:
+        with path.open("ab"):
+            return False
+    except PermissionError:
+        return True
+    except OSError:
+        # 其它错误（路径异常等）按未占用处理，避免打包前又白等满超时。
+        return False
+
+
+def _wait_until_unlocked(paths: Iterable[Path], *, timeout: float = LOCK_TIMEOUT,
+                         interval: float = LOCK_POLL_INTERVAL) -> list[Path]:
+    """等旧实例释放这些产物的文件锁，返回超时后仍被占用的文件。
+
+    判据是真占用而不是「产物文件是否存在」：产物本来就在，拿存在与否判断会让每次打包都白等
+    满超时。未被占用的产物不会触发任何等待。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        locked = [path for path in paths if _is_locked(path)]
+        if not locked or time.monotonic() >= deadline:
+            return locked
+        time.sleep(interval)
+
+
 def kill_old():
     """终止正在运行的旧实例。"""
-    import time
-
     print("[1/5] 终止旧进程...")
     # 杀所有匹配的时辰筏进程（含 onedir 和旧 onefile 产物）
     ps = (
@@ -46,14 +82,12 @@ def kill_old():
     subprocess.run(["powershell", "-NoProfile", "-Command", ps2],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 等文件锁释放
-    for _ in range(30):
-        locked = any(
-            p.exists() for p in [MAIN_EXE, DIST / f"{EXE_NAME}.exe", DIST / "wake.exe"]
-        )
-        if not locked:
-            break
-        time.sleep(0.2)
+    # 等文件锁释放：只有真的还被占用才等，未占用立刻返回
+    locked = _wait_until_unlocked([MAIN_EXE, DIST / f"{EXE_NAME}.exe", DIST / "wake.exe"])
+    if locked:
+        print(f"       等待 {LOCK_TIMEOUT:.0f} 秒后仍有进程占用产物，继续打包可能失败：")
+        for path in locked:
+            print(f"         - {path}")
 
 
 def clean():
