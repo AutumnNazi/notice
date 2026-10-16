@@ -5,6 +5,8 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+from PIL import Image, ImageDraw, ImageTk
+
 from core.font_manager import register_font_directory
 from gui.message_dialog import show_warning
 from gui.theme import (
@@ -39,153 +41,54 @@ class FontPicker(tk.Frame):
         self.pack_propagate(False)
         self.variable = variable
         self.values = list(values)
-        self.family = family
-        self.ui_scale = ui_scale
-        self.popup: tk.Toplevel | None = None
-        self.search_var = tk.StringVar()
-
-        self.shell = RoundedFrame(
-            self,
-            radius=scale(10, ui_scale),
-            padding=scale(8, ui_scale),
-            fill=PALETTE.card_bg,
-            outline=PALETTE.border,
-            bg=bg or PALETTE.card_bg,
-            width=width,
-            height=height,
-            cursor="hand2",
+        # Tk 原生下拉列表负责外部点击、Esc、失焦和 modal grab 的配对恢复。
+        for option, value in {
+            "font": font(family, 10, ui_scale),
+            "background": PALETTE.card_bg,
+            "foreground": PALETTE.text_primary,
+            "selectBackground": PALETTE.accent_soft,
+            "selectForeground": PALETTE.text_primary,
+        }.items():
+            self.option_add(f"*TCombobox*Listbox.{option}", value)
+        style = ttk.Style(self)
+        style_name = f"FontPicker{round(ui_scale * 100)}.TCombobox"
+        arrow_element = f"FontPicker{round(ui_scale * 100)}.downarrow"
+        if arrow_element not in style.element_names():
+            # 高分辨率绘制后缩小，保持细线箭头在不同 DPI 下平滑。
+            image_width, image_height = scale(26, ui_scale), scale(18, ui_scale)
+            arrow_images = []
+            for color in (PALETTE.text_secondary, PALETTE.text_primary, PALETTE.text_muted):
+                image = Image.new("RGBA", (image_width * 4, image_height * 4))
+                draw = ImageDraw.Draw(image)
+                points = [(scale(x, ui_scale) * 4, scale(y, ui_scale) * 4)
+                          for x, y in ((8, 7), (12, 11), (16, 7))]
+                draw.line(points, fill=color, width=max(4, round(5 * ui_scale)), joint="curve")
+                image = image.resize((image_width, image_height), Image.Resampling.LANCZOS)
+                arrow_images.append(ImageTk.PhotoImage(image, master=self))
+            style.element_create(arrow_element, "image", arrow_images[0],
+                                 ("active", arrow_images[1]), ("disabled", arrow_images[2]))
+            # ttk 元素会跨设置窗口重用，图片须与 Tk 根窗口同寿命。
+            root = self._root()
+            if not hasattr(root, "_font_picker_arrow_images"):
+                root._font_picker_arrow_images = []
+            root._font_picker_arrow_images.extend(arrow_images)
+        style.layout(style_name, [
+            ("Combobox.field", {"sticky": "nswe", "children": [
+                (arrow_element, {"side": "right", "sticky": ""}),
+                ("Combobox.padding", {"sticky": "nswe", "children": [
+                    ("Combobox.textarea", {"sticky": "nswe"}),
+                ]}),
+            ]}),
+        ])
+        self.combobox = ttk.Combobox(
+            self, textvariable=variable, values=self.values, state="readonly",
+            height=10, font=font(family, 10, ui_scale), style=style_name,
         )
-        self.shell.pack(fill=tk.BOTH, expand=True)
-        self.shell.content.grid_columnconfigure(0, weight=1)
-        self.label = tk.Label(
-            self.shell.content,
-            text=self.variable.get(),
-            bg=PALETTE.card_bg,
-            fg=PALETTE.text_primary,
-            font=font(family, 10, ui_scale),
-            anchor="w",
-        )
-        self.label.grid(row=0, column=0, sticky="ew")
-        self.arrow = tk.Label(
-            self.shell.content,
-            text="⌄",
-            bg=PALETTE.card_bg,
-            fg=PALETTE.text_secondary,
-            font=font(family, 11, ui_scale),
-        )
-        self.arrow.grid(row=0, column=1, sticky="e", padx=(scale(8, ui_scale), 0))
-
-        for widget in (self, self.shell, self.shell.content, self.label, self.arrow):
-            widget.bind("<Button-1>", self._open_popup)
-        self.variable.trace_add("write", lambda *_args: self._sync_label())
-
-    def _sync_label(self) -> None:
-        self.label.configure(text=self.variable.get())
+        self.combobox.pack(fill=tk.BOTH, expand=True)
 
     def set_values(self, values: list[str]) -> None:
         self.values = list(values)
-        if self.popup is not None and self.popup.winfo_exists():
-            self._refresh_popup_values()
-
-    def _open_popup(self, _event: tk.Event | None = None) -> None:
-        if self.popup is not None and self.popup.winfo_exists():
-            self.popup.destroy()
-            self.popup = None
-            return
-
-        self.popup = tk.Toplevel(self)
-        self.popup.overrideredirect(True)
-        self.popup.configure(bg=PALETTE.card_bg)
-        self.popup.transient(self.winfo_toplevel())
-        popup_width = max(self.winfo_width(), scale(260, self.ui_scale))
-        popup_height = scale(260, self.ui_scale)
-        self.popup.geometry(f"{popup_width}x{popup_height}+{self.winfo_rootx()}+{self.winfo_rooty() + self.winfo_height() + scale(6, self.ui_scale)}")
-
-        container = RoundedFrame(
-            self.popup,
-            radius=scale(12, self.ui_scale),
-            padding=scale(10, self.ui_scale),
-            fill=PALETTE.card_bg,
-            outline=PALETTE.border,
-            shadow=True,
-            bg=PALETTE.card_bg,
-            width=popup_width,
-            height=popup_height,
-        )
-        container.pack(fill=tk.BOTH, expand=True)
-        body = container.content
-        body.grid_columnconfigure(0, weight=1)
-        body.grid_rowconfigure(1, weight=1)
-
-        search = tk.Entry(
-            body,
-            textvariable=self.search_var,
-            bg=PALETTE.card_bg,
-            fg=PALETTE.text_primary,
-            insertbackground=PALETTE.text_primary,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=PALETTE.border_soft,
-            highlightcolor=PALETTE.border,
-            font=font(self.family, 10, self.ui_scale),
-        )
-        search.grid(row=0, column=0, columnspan=2, sticky="ew", ipady=scale(5, self.ui_scale), pady=(0, scale(8, self.ui_scale)))
-
-        self.listbox = tk.Listbox(
-            body,
-            activestyle="none",
-            bg=PALETTE.card_bg,
-            fg=PALETTE.text_primary,
-            selectbackground=PALETTE.accent_soft,
-            selectforeground=PALETTE.text_primary,
-            highlightthickness=0,
-            relief="flat",
-            borderwidth=0,
-            exportselection=False,
-            font=font(self.family, 10, self.ui_scale),
-        )
-        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=scrollbar.set)
-        self.listbox.grid(row=1, column=0, sticky="nsew")
-        scrollbar.grid(row=1, column=1, sticky="ns")
-
-        self.search_var.set("")
-        self.search_var.trace_add("write", lambda *_args: self._refresh_popup_values())
-        self._refresh_popup_values()
-        self.listbox.bind("<Double-Button-1>", lambda _event: self._choose_active())
-        self.listbox.bind("<Return>", lambda _event: self._choose_active())
-        self.popup.bind("<Escape>", lambda _event: self._close_popup())
-        search.bind("<Return>", lambda _event: self._choose_active())
-        search.focus_set()
-
-    def _refresh_popup_values(self) -> None:
-        if not hasattr(self, "listbox"):
-            return
-        keyword = self.search_var.get().strip().lower()
-        filtered = [value for value in self.values if keyword in value.lower()]
-        self.listbox.delete(0, tk.END)
-        for value in filtered:
-            self.listbox.insert(tk.END, value)
-        current = self.variable.get()
-        if current in filtered:
-            index = filtered.index(current)
-            self.listbox.selection_set(index)
-            self.listbox.see(index)
-        elif filtered:
-            self.listbox.selection_set(0)
-
-    def _choose_active(self) -> str:
-        selection = self.listbox.curselection()
-        if not selection:
-            return "break"
-        self.variable.set(self.listbox.get(selection[0]))
-        self._close_popup()
-        return "break"
-
-    def _close_popup(self) -> None:
-        if self.popup is not None and self.popup.winfo_exists():
-            self.popup.destroy()
-        self.popup = None
+        self.combobox.configure(values=self.values)
 
 
 class SettingsDialog(tk.Toplevel):
@@ -245,7 +148,7 @@ class SettingsDialog(tk.Toplevel):
             radius=scale(14, self.ui_scale),
             padding=scale(22, self.ui_scale),
             fill=PALETTE.card_bg,
-            outline=PALETTE.border_soft,
+            outline=PALETTE.border,
             shadow=False,
             bg=PALETTE.card_bg,
             width=scale(440, self.ui_scale),

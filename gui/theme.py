@@ -155,6 +155,7 @@ class PillButton(tk.Canvas):
         radius: int = 14,
         weight: str = "normal",
         bg: str | None = None,
+        dot_color: str | None = None,
     ) -> None:
         super().__init__(
             master,
@@ -175,6 +176,7 @@ class PillButton(tk.Canvas):
         self.family = family
         self.ui_scale = ui_scale
         self.weight = weight
+        self.dot_color = dot_color
         self._hover = False
         self.bind("<Configure>", lambda _event: self._draw())
         self.bind("<Enter>", self._enter)
@@ -184,6 +186,31 @@ class PillButton(tk.Canvas):
 
     def set_text(self, text: str) -> None:
         self.text = text
+        self._draw()
+
+    def set_dot_color(self, dot_color: str | None) -> None:
+        self.dot_color = dot_color
+        self._draw()
+
+    def set_colors(
+        self,
+        *,
+        fill: str | None = None,
+        active_fill: str | None = None,
+        fg: str | None = None,
+        outline: str | None = None,
+        dot_color: str | None = None,
+    ) -> None:
+        if fill is not None:
+            self.fill = fill
+        if active_fill is not None:
+            self.active_fill = active_fill
+        if fg is not None:
+            self.fg = fg
+        if outline is not None:
+            self.outline = outline
+        if dot_color is not None:
+            self.dot_color = dot_color
         self._draw()
 
     def _enter(self, _event: tk.Event) -> None:
@@ -209,13 +236,40 @@ class PillButton(tk.Canvas):
             outline=self.outline,
             tag="button",
         )
-        self.create_text(
-            width // 2,
-            height // 2,
-            text=self.text,
-            fill=self.fg,
-            font=font(self.family, 10, self.ui_scale, self.weight),
-        )
+        btn_font = font(self.family, 10, self.ui_scale, self.weight)
+        if self.dot_color:
+            import tkinter.font as tkfont
+            dot_r = max(2, int(round(3 * self.ui_scale)))
+            gap = max(3, int(round(6 * self.ui_scale)))
+            font_obj = tkfont.Font(font=btn_font)
+            text_w = font_obj.measure(self.text)
+            total_w = dot_r * 2 + gap + text_w
+            dot_x = max(dot_r + 2, (width - total_w) // 2 + dot_r)
+            dot_y = height // 2
+            self.create_oval(
+                dot_x - dot_r,
+                dot_y - dot_r,
+                dot_x + dot_r,
+                dot_y + dot_r,
+                fill=self.dot_color,
+                outline="",
+            )
+            self.create_text(
+                dot_x + dot_r + gap,
+                dot_y,
+                text=self.text,
+                fill=self.fg,
+                font=btn_font,
+                anchor="w",
+            )
+        else:
+            self.create_text(
+                width // 2,
+                height // 2,
+                text=self.text,
+                fill=self.fg,
+                font=btn_font,
+            )
 
 
 class RoundedEntry(tk.Canvas):

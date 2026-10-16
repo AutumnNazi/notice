@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import logging
 import queue
 import random
 import sys
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 import winreg
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import ttk
 
@@ -18,7 +20,7 @@ from PIL import Image, ImageTk
 from config import APP_NAME, BOAT_ART_FILE, FONT_DIR, ICON_FILE, ICON_ICO_FILE, ICON_PNG_FILES, TRIGGER_TYPES
 from core.font_manager import register_font_directories
 from core.icon_assets import ensure_icon_assets
-from core.live_info import WEATHER_REFRESH_SECONDS, WEATHER_RETRY_SECONDS, Weather, fetch_weather, lunar_date
+from core.live_info import LUNAR_RETRY_SECONDS, WEATHER_REFRESH_SECONDS, WEATHER_RETRY_SECONDS, Weather, fetch_weather, lunar_date
 from core.models import Task
 from core.notifier import Notifier
 from core.quotes import APP_QUOTES
@@ -34,6 +36,7 @@ from store import TaskStore
 
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+SEARCH_PLACEHOLDER = "搜索标题、内容或周期..."
 
 
 class NoticeApp:
@@ -66,12 +69,16 @@ class NoticeApp:
         self.quote_source_var = tk.StringVar()
         self.today_var = tk.StringVar()
         self._clock_after_id: str | None = None
+        self._display_day: date | None = None
         self.weather_var = tk.StringVar(value="天气获取中…")
+        self.weather_meta_var = tk.StringVar()
         self.lunar_var = tk.StringVar()
         self.ganzhi_var = tk.StringVar()
         self._weather: Weather | None = None
         self._weather_failed = False
         self._lunar_day: date | None = None
+        self._lunar_pending: date | None = None
+        self._lunar_retry_at = 0.0
         self._weather_after_id: str | None = None
         self._live_info_queue: queue.Queue = queue.Queue()
         self.subtitle_var = tk.StringVar()
@@ -87,6 +94,8 @@ class NoticeApp:
         self.pause_button: PillButton | None = None
         self.scroll_frame: tk.Frame | None = None
         self.search_entry: tk.Entry | None = None
+        self.filter_btn: tk.Label | None = None
+        self.filter_type: str = "all"
         self.task_canvas: tk.Canvas | None = None
         self.shell: tk.Frame | None = None
         self.left_panel: tk.Frame | None = None
@@ -94,6 +103,12 @@ class NoticeApp:
         self.home_intro_frame: tk.Frame | None = None
         self.home_intro_title: tk.Label | None = None
         self.home_intro_body: tk.Label | None = None
+        self.quote_label: tk.Label | None = None
+        self.season_card = None
+        self.panel_content: tk.Frame | None = None
+        self.home_divider: tk.Frame | None = None
+        self._quote_wrap: int | None = None
+        self._quote_side_by_side: bool | None = None
         self.home_art: tk.Canvas | None = None
         self.home_art_size: tuple[int, int] | None = None
 
@@ -132,18 +147,46 @@ class NoticeApp:
         except tk.TclError:
             pass
 
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        width = min(scale(1280, self.ui_scale), max(screen_width - scale(80, self.ui_scale), scale(1080, self.ui_scale)))
-        height = min(scale(760, self.ui_scale), max(screen_height - scale(80, self.ui_scale), scale(680, self.ui_scale)))
-        min_width = min(scale(1080, self.ui_scale), screen_width)
-        min_height = min(scale(660, self.ui_scale), screen_height)
-        x = max((screen_width - width) // 2, 0)
-        y = max((screen_height - height) // 2, 0)
+        # 混合 DPI 多显示器下 winfo_screenwidth() 的单位不可靠，改用主屏工作区。
+        # DPI 感知进程的 Tk 几何与 GetSystemMetrics 均为物理像素，这里保持物理单位。
+        work_width, work_height = self._primary_work_area()
+        avail_width = max(1, work_width - scale(80, self.ui_scale))
+        avail_height = max(1, work_height - scale(80, self.ui_scale))
+        width = min(scale(1280, self.ui_scale), avail_width)
+        height = min(scale(760, self.ui_scale), avail_height)
+        min_width = min(scale(1080, self.ui_scale), avail_width)
+        min_height = min(scale(660, self.ui_scale), avail_height)
+        origin_x, origin_y = getattr(self, "_work_area_origin", (0, 0))
+        x = origin_x + max((work_width - width) // 2, 0)
+        y = origin_y + max((work_height - height) // 2, 0)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
         self.root.minsize(min_width, min_height)
 
+    def _primary_work_area(self) -> tuple[int, int]:
+        # SPI_GETWORKAREA 返回主屏工作区（不含任务栏）的物理像素。
+        try:
+            rect = ctypes.wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                self._work_area_origin = (rect.left, rect.top)
+                return rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+        self._work_area_origin = (0, 0)
+        return self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
     def _detect_window_dpi(self) -> int:
+        # 以主屏 DPI 为准：窗口刚创建时可能落在副屏，按窗口当前显示器取 DPI
+        # 会得到不一致的缩放；本应用的窗口始终布局在主屏工作区内。
+        try:
+            point = ctypes.wintypes.POINT(0, 0)
+            monitor = ctypes.windll.user32.MonitorFromPoint(point, 1)  # MONITOR_DEFAULTTOPRIMARY
+            if monitor:
+                dpi_x = ctypes.c_uint(0)
+                dpi_y = ctypes.c_uint(0)
+                if ctypes.windll.shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y)) == 0:
+                    return int(dpi_x.value)
+        except Exception:
+            pass
         try:
             hwnd = self.root.winfo_id()
             return int(ctypes.windll.user32.GetDpiForWindow(hwnd))
@@ -194,6 +237,7 @@ class NoticeApp:
         self.pause_button = None
         self.scroll_frame = None
         self.search_entry = None
+        self.filter_btn = None
         self.task_canvas = None
         self.shell = None
         self.left_panel = None
@@ -203,6 +247,12 @@ class NoticeApp:
         self.home_intro_body = None
         self.home_art = None
         self.home_art_size = None
+        self.quote_label = None
+        self.season_card = None
+        self.panel_content = None
+        self.home_divider = None
+        self._quote_wrap = None
+        self._quote_side_by_side = None
         self.root.configure(bg=PALETTE.window_bg)
         self._configure_styles()
         self._build_ui()
@@ -289,14 +339,19 @@ class NoticeApp:
         ).grid(row=0, column=0, sticky="ew")
         self.pause_button = PillButton(
             top,
-            "☷",
+            "全部运行",
             self.toggle_pause_all,
-            width=scale(58, self.ui_scale),
+            width=scale(88, self.ui_scale),
             height=scale(42, self.ui_scale),
             family=self.font_family_var.get(),
             ui_scale=self.ui_scale,
             radius=scale(14, self.ui_scale),
             bg=PALETTE.card_bg,
+            fill="#fbf7f1",
+            active_fill="#eee2d3",
+            outline=PALETTE.border,
+            fg=PALETTE.text_secondary,
+            dot_color="#10b981",
         )
         self.pause_button.grid(row=0, column=1, sticky="e", padx=(scale(12, self.ui_scale), 0))
 
@@ -308,14 +363,14 @@ class NoticeApp:
             radius=scale(13, self.ui_scale),
             padding=scale(9, self.ui_scale),
             fill=PALETTE.card_bg,
-            outline=PALETTE.border_soft,
+            outline=PALETTE.border,
             bg=PALETTE.card_bg,
             height=scale(40, self.ui_scale),
         )
         search_box.grid(row=0, column=0, sticky="ew")
         search_box.content.grid_columnconfigure(1, weight=1)
         if not self.search_var.get().strip():
-            self.search_var.set("搜索提醒")
+            self.search_var.set(SEARCH_PLACEHOLDER)
         tk.Label(
             search_box.content,
             text="⌕",
@@ -327,7 +382,7 @@ class NoticeApp:
             search_box.content,
             textvariable=self.search_var,
             bg=PALETTE.card_bg,
-            fg=PALETTE.text_muted if self.search_var.get() == "搜索提醒" else PALETTE.text_primary,
+            fg=PALETTE.text_muted if self.search_var.get() in (SEARCH_PLACEHOLDER, "搜索提醒") else PALETTE.text_primary,
             insertbackground=PALETTE.text_primary,
             relief="flat",
             highlightthickness=0,
@@ -335,13 +390,16 @@ class NoticeApp:
             font=font(self.font_family_var.get(), 10, self.ui_scale),
         )
         self.search_entry.grid(row=0, column=1, sticky="ew")
-        tk.Label(
+        self.filter_btn = tk.Label(
             search_box.content,
             text="≡",
             bg=PALETTE.card_bg,
-            fg=PALETTE.text_secondary,
+            fg=PALETTE.text_secondary if self.filter_type == "all" else PALETTE.accent_text,
             font=font(self.font_family_var.get(), 11, self.ui_scale),
-        ).grid(row=0, column=2, sticky="e", padx=(scale(8, self.ui_scale), scale(2, self.ui_scale)))
+            cursor="hand2",
+        )
+        self.filter_btn.grid(row=0, column=2, sticky="e", padx=(scale(8, self.ui_scale), scale(2, self.ui_scale)))
+        self.filter_btn.bind("<Button-1>", lambda _event: self._open_filter_menu(self.filter_btn))
         self.search_entry.bind("<FocusIn>", self._search_focus_in)
         self.search_entry.bind("<FocusOut>", self._search_focus_out)
 
@@ -375,18 +433,44 @@ class NoticeApp:
             justify=tk.CENTER,
         )
 
-        bottom = tk.Frame(left, bg=PALETTE.card_bg, padx=scale(28, self.ui_scale), pady=scale(18, self.ui_scale))
+        bottom = tk.Frame(left, bg=PALETTE.card_bg, padx=scale(20, self.ui_scale), pady=scale(14, self.ui_scale))
         bottom.grid(row=3, column=0, columnspan=2, sticky="ew")
         tk.Frame(left, bg=PALETTE.border_soft, height=1).grid(row=3, column=0, columnspan=2, sticky="new")
-        tk.Label(
-            bottom,
+
+        settings_btn_frame = tk.Frame(bottom, bg=PALETTE.card_bg, cursor="hand2")
+        settings_btn_frame.pack(side=tk.LEFT)
+        gear_lbl = tk.Label(
+            settings_btn_frame,
             text="⚙",
             bg=PALETTE.card_bg,
             fg=PALETTE.text_secondary,
+            font=font(self.font_family_var.get(), 12, self.ui_scale),
             cursor="hand2",
-            font=font(self.font_family_var.get(), 15, self.ui_scale),
-        ).pack(side=tk.LEFT)
-        bottom.winfo_children()[0].bind("<Button-1>", lambda _event: self.open_settings())
+        )
+        gear_lbl.pack(side=tk.LEFT)
+        settings_text_lbl = tk.Label(
+            settings_btn_frame,
+            text="偏好设置",
+            bg=PALETTE.card_bg,
+            fg=PALETTE.text_secondary,
+            font=font(self.font_family_var.get(), 9, self.ui_scale),
+            cursor="hand2",
+            padx=scale(6, self.ui_scale),
+        )
+        settings_text_lbl.pack(side=tk.LEFT)
+
+        for w in (settings_btn_frame, gear_lbl, settings_text_lbl):
+            w.bind("<Button-1>", lambda _event: self.open_settings())
+            w.bind("<Enter>", lambda _event: (gear_lbl.configure(fg=PALETTE.accent_text), settings_text_lbl.configure(fg=PALETTE.accent_text)))
+            w.bind("<Leave>", lambda _event: (gear_lbl.configure(fg=PALETTE.text_secondary), settings_text_lbl.configure(fg=PALETTE.text_secondary)))
+
+        tk.Label(
+            bottom,
+            textvariable=self.summary_var,
+            bg=PALETTE.card_bg,
+            fg=PALETTE.text_muted,
+            font=font(self.font_family_var.get(), 9, self.ui_scale),
+        ).pack(side=tk.RIGHT)
         tk.Frame(parent, bg=PALETTE.border_soft, width=1).grid(row=1, column=0, sticky="nse")
 
     def _build_right_panel(self, parent: tk.Frame) -> None:
@@ -415,79 +499,130 @@ class NoticeApp:
         panel.content.grid_columnconfigure(0, weight=1)
         panel.content.grid_columnconfigure(1, weight=0)
         panel.content.grid_rowconfigure(2, weight=1)
+        panel.content.bind("<Configure>", self._resize_quote_layout)
+        self.panel_content = panel.content
 
         quote_block = tk.Frame(panel.content, bg=PALETTE.card_bg)
-        quote_block.grid(row=0, column=0, sticky="nw", pady=(scale(36, self.ui_scale), 0))
-        tk.Label(
+        quote_block.grid(row=0, column=0, sticky="nw", pady=(scale(30, self.ui_scale), 0))
+        quote_lbl = tk.Label(
             quote_block,
             textvariable=self.quote_var,
             bg=PALETTE.card_bg,
             fg=PALETTE.text_primary,
             font=font(self.font_family_var.get(), 22, self.ui_scale),
             justify=tk.LEFT,
-            wraplength=scale(760, self.ui_scale),
-        ).pack(anchor="w")
+            anchor="w",
+            wraplength=scale(680, self.ui_scale),
+        )
+        quote_lbl.pack(anchor="w")
+        self.quote_label = quote_lbl
+
+        quote_meta = tk.Frame(quote_block, bg=PALETTE.card_bg)
+        quote_meta.pack(anchor="e", fill=tk.X, pady=(scale(14, self.ui_scale), 0))
+
+        meta_inner = tk.Frame(quote_meta, bg=PALETTE.card_bg)
+        meta_inner.pack(side=tk.RIGHT)
+
+        tk.Frame(meta_inner, bg="#d7c3aa", width=scale(24, self.ui_scale), height=1).pack(side=tk.LEFT, padx=(0, scale(8, self.ui_scale)), pady=scale(6, self.ui_scale))
         tk.Label(
-            quote_block,
+            meta_inner,
             textvariable=self.quote_source_var,
             bg=PALETTE.card_bg,
             fg=PALETTE.text_secondary,
             font=font(self.font_family_var.get(), 11, self.ui_scale),
-            pady=scale(18, self.ui_scale),
-        ).pack(anchor="w")
+        ).pack(side=tk.LEFT)
+        refresh_quote_lbl = tk.Label(
+            meta_inner,
+            text="换一句",
+            bg=PALETTE.card_bg,
+            fg=PALETTE.text_muted,
+            font=font(self.font_family_var.get(), 9, self.ui_scale),
+            cursor="hand2",
+            padx=scale(10, self.ui_scale),
+        )
+        refresh_quote_lbl.pack(side=tk.LEFT)
+        refresh_quote_lbl.bind("<Enter>", lambda _e: refresh_quote_lbl.configure(fg=PALETTE.accent_text))
+        refresh_quote_lbl.bind("<Leave>", lambda _e: refresh_quote_lbl.configure(fg=PALETTE.text_muted))
+        refresh_quote_lbl.bind("<Button-1>", lambda _e: self._set_random_quote())
 
-        side = tk.Frame(panel.content, bg=PALETTE.card_bg)
-        side.grid(row=0, column=1, sticky="ne", padx=(scale(28, self.ui_scale), 0), pady=(scale(4, self.ui_scale), 0))
+        season_card = RoundedFrame(
+            panel.content,
+            radius=scale(14, self.ui_scale),
+            padding=scale(16, self.ui_scale),
+            fill=PALETTE.card_alt_bg,
+            outline=PALETTE.border,
+            shadow=False,
+            bg=PALETTE.card_bg,
+            width=scale(210, self.ui_scale),
+        )
+        season_card.grid(row=0, column=1, sticky="ne", padx=(scale(24, self.ui_scale), 0), pady=(scale(6, self.ui_scale), 0))
+        self.season_card = season_card
+        sc_content = season_card.content
+        sc_content.configure(bg=PALETTE.card_alt_bg)
+
         tk.Label(
-            side,
+            sc_content,
             textvariable=self.weather_var,
-            bg=PALETTE.card_bg,
+            bg=PALETTE.card_alt_bg,
             fg=PALETTE.text_secondary,
             font=font(self.font_family_var.get(), 10, self.ui_scale),
-        ).pack(anchor="e")
+            anchor="e",
+        ).pack(anchor="e", fill=tk.X)
         tk.Label(
-            side,
+            sc_content,
+            textvariable=self.weather_meta_var,
+            bg=PALETTE.card_alt_bg,
+            fg=PALETTE.text_muted,
+            font=font(self.font_family_var.get(), 8, self.ui_scale),
+            wraplength=scale(176, self.ui_scale),
+            justify=tk.RIGHT,
+            anchor="e",
+        ).pack(anchor="e", fill=tk.X, pady=(scale(3, self.ui_scale), scale(6, self.ui_scale)))
+        tk.Label(
+            sc_content,
             textvariable=self.today_var,
-            bg=PALETTE.card_bg,
-            fg=PALETTE.text_secondary,
-            font=font(self.font_family_var.get(), 10, self.ui_scale),
-            pady=scale(46, self.ui_scale),
-        ).pack(anchor="e", pady=(0, scale(10, self.ui_scale)))
+            bg=PALETTE.card_alt_bg,
+            fg=PALETTE.text_muted,
+            font=font(self.font_family_var.get(), 9, self.ui_scale),
+            anchor="e",
+        ).pack(anchor="e", fill=tk.X, pady=(scale(3, self.ui_scale), scale(4, self.ui_scale)))
         tk.Label(
-            side,
+            sc_content,
             textvariable=self.lunar_var,
-            bg=PALETTE.card_bg,
+            bg=PALETTE.card_alt_bg,
             fg=PALETTE.text_primary,
-            font=font(self.font_family_var.get(), 26, self.ui_scale),
-        ).pack(anchor="e")
+            font=font(self.font_family_var.get(), 20, self.ui_scale, "bold"),
+            anchor="e",
+        ).pack(anchor="e", fill=tk.X)
         tk.Label(
-            side,
+            sc_content,
             textvariable=self.ganzhi_var,
-            bg=PALETTE.card_bg,
+            bg=PALETTE.card_alt_bg,
             fg=PALETTE.text_secondary,
-            font=font(self.font_family_var.get(), 10, self.ui_scale),
-            pady=scale(10, self.ui_scale),
-        ).pack(anchor="e")
+            font=font(self.font_family_var.get(), 9, self.ui_scale),
+            anchor="e",
+        ).pack(anchor="e", fill=tk.X, pady=(scale(3, self.ui_scale), 0))
 
         divider = tk.Frame(panel.content, bg=PALETTE.border_soft, height=1)
-        divider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(scale(34, self.ui_scale), scale(28, self.ui_scale)))
+        divider.grid(row=1, column=0, columnspan=2, sticky="ew", padx=scale(16, self.ui_scale), pady=(scale(34, self.ui_scale), scale(28, self.ui_scale)))
+        self.home_divider = divider
 
         content = tk.Frame(panel.content, bg=PALETTE.card_bg)
         self.home_intro_content = content
         content.grid(row=2, column=0, columnspan=2, sticky="nsew")
         content.grid_columnconfigure(0, weight=1)
         content.grid_columnconfigure(1, weight=0)
-        content.grid_rowconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=1)
         intro_text = tk.Frame(content, bg=PALETTE.card_bg)
         self.home_intro_frame = intro_text
-        intro_text.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(scale(8, self.ui_scale), 0))
+        intro_text.grid(row=0, column=0, sticky="sw", padx=(scale(12, self.ui_scale), 0), pady=(0, scale(12, self.ui_scale)))
         intro_text.grid_columnconfigure(0, weight=1)
         self.home_intro_title = tk.Label(
             intro_text,
             textvariable=self.subtitle_var,
             bg=PALETTE.card_bg,
             fg=PALETTE.text_primary,
-            font=font(self.font_family_var.get(), 15, self.ui_scale, "bold"),
+            font=font(self.font_family_var.get(), 14, self.ui_scale, "bold"),
             justify=tk.LEFT,
             anchor="w",
             wraplength=scale(480, self.ui_scale),
@@ -498,24 +633,24 @@ class NoticeApp:
             text="在纷杂的世界里，\n为重要的事情，设一只小小的筏。\n它不喧哗，只在恰当的时候，轻轻提醒你。",
             bg=PALETTE.card_bg,
             fg=PALETTE.text_secondary,
-            font=font(self.font_family_var.get(), 13, self.ui_scale),
+            font=font(self.font_family_var.get(), 11, self.ui_scale),
             justify=tk.LEFT,
             anchor="nw",
-            pady=scale(18, self.ui_scale),
+            pady=scale(12, self.ui_scale),
             wraplength=scale(480, self.ui_scale),
         )
         self.home_intro_body.grid(row=1, column=0, sticky="ew")
         art = tk.Canvas(
             content,
-            width=scale(420, self.ui_scale),
-            height=scale(220, self.ui_scale),
+            width=scale(360, self.ui_scale),
+            height=scale(180, self.ui_scale),
             bg=PALETTE.card_bg,
             highlightthickness=0,
             bd=0,
         )
         self.home_art = art
-        art.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(scale(40, self.ui_scale), 0), pady=(scale(120, self.ui_scale), scale(32, self.ui_scale)))
-        self._configure_home_art_size(scale(420, self.ui_scale), scale(220, self.ui_scale))
+        art.grid(row=0, column=1, sticky="se", padx=(scale(20, self.ui_scale), scale(12, self.ui_scale)), pady=(0, scale(12, self.ui_scale)))
+        self._configure_home_art_size(scale(360, self.ui_scale), scale(180, self.ui_scale))
         content.bind("<Configure>", self._resize_home_intro)
 
     def _resize_main_layout(self, event: tk.Event) -> None:
@@ -527,58 +662,105 @@ class NoticeApp:
         if abs(self.left_panel.winfo_width() - target_width) > 1:
             self.left_panel.configure(width=target_width)
 
+    def _resize_quote_layout(self, event: tk.Event) -> None:
+        # 名言与时间天气卡随可用宽度在「并排 / 堆叠」间切换；并排时名言换行宽度
+        # 按剩余空间收窄，避免溢出第 0 列被右侧时间天气卡盖住。
+        if not all((self.quote_label, self.season_card, self.home_divider,
+                    self.home_intro_content, self.panel_content)):
+            return
+        season_width = self.season_card.winfo_reqwidth()
+        gap = scale(24, self.ui_scale)
+        min_quote = scale(240, self.ui_scale)
+        side_by_side = event.width - season_width - gap - scale(8, self.ui_scale) >= min_quote
+        if side_by_side != self._quote_side_by_side:
+            self._quote_side_by_side = side_by_side
+            if side_by_side:
+                self.season_card.grid_configure(
+                    row=0, column=1, sticky="ne",
+                    padx=(gap, 0), pady=(scale(6, self.ui_scale), 0))
+                self.home_divider.grid_configure(row=1)
+                self.home_intro_content.grid_configure(row=2)
+                self.panel_content.grid_rowconfigure(2, weight=1)
+                self.panel_content.grid_rowconfigure(3, weight=0)
+            else:
+                self.season_card.grid_configure(
+                    row=1, column=0, sticky="ne",
+                    padx=(0, 0), pady=(scale(10, self.ui_scale), 0))
+                self.home_divider.grid_configure(row=2)
+                self.home_intro_content.grid_configure(row=3)
+                self.panel_content.grid_rowconfigure(2, weight=0)
+                self.panel_content.grid_rowconfigure(3, weight=1)
+        if side_by_side:
+            available = event.width - season_width - gap - scale(8, self.ui_scale)
+            wrap = max(min_quote, min(scale(680, self.ui_scale), available))
+        else:
+            wrap = max(min_quote, event.width - scale(16, self.ui_scale))
+        if wrap != self._quote_wrap:
+            self._quote_wrap = wrap
+            self.quote_label.configure(wraplength=wrap)
+
     def _resize_home_intro(self, event: tk.Event) -> None:
         if not all((self.home_intro_content, self.home_intro_frame, self.home_intro_title, self.home_intro_body, self.home_art)):
             return
-        narrow = event.width < scale(1500, self.ui_scale)
-        compact_height = event.height < scale(620, self.ui_scale)
-        tight_height = event.height < scale(360, self.ui_scale)
+        narrow = event.width < scale(560, self.ui_scale)
+        compact_height = event.height < scale(360, self.ui_scale)
+        tight_height = event.height < scale(240, self.ui_scale)
         if tight_height:
-            art_width = scale(160, self.ui_scale)
-            art_height = scale(84, self.ui_scale)
+            art_width = scale(180, self.ui_scale)
+            art_height = scale(90, self.ui_scale)
+        elif compact_height or narrow:
+            art_width = scale(260, self.ui_scale)
+            art_height = scale(130, self.ui_scale)
         else:
-            art_width = scale(320 if narrow or compact_height else 420, self.ui_scale)
-            art_height = scale(168 if narrow or compact_height else 220, self.ui_scale)
+            art_width = scale(340, self.ui_scale)
+            art_height = scale(170, self.ui_scale)
         self._configure_home_art_size(art_width, art_height)
+
         if narrow:
-            wrap_width = max(scale(320, self.ui_scale), event.width - scale(48, self.ui_scale))
+            wrap_width = max(scale(260, self.ui_scale), event.width - scale(32, self.ui_scale))
             self.home_intro_content.grid_columnconfigure(0, weight=1)
             self.home_intro_content.grid_columnconfigure(1, weight=0)
+            self.home_intro_content.grid_rowconfigure(0, weight=1)
+            self.home_intro_content.grid_rowconfigure(1, weight=0)
             self.home_intro_frame.grid_configure(
                 row=0,
                 column=0,
                 rowspan=1,
-                sticky="new",
-                padx=(scale(8, self.ui_scale), scale(8, self.ui_scale)),
+                sticky="sw",
+                padx=(scale(12, self.ui_scale), scale(12, self.ui_scale)),
+                pady=(0, scale(4, self.ui_scale)),
             )
             self.home_art.grid()
             self.home_art.grid_configure(
                 row=1,
                 column=0,
                 rowspan=1,
-                sticky="ne",
-                padx=(0, scale(8, self.ui_scale)),
-                pady=(scale(12 if tight_height else 22, self.ui_scale), scale(18 if tight_height else 32, self.ui_scale)),
+                sticky="se",
+                padx=(0, scale(12, self.ui_scale)),
+                pady=(0, scale(12, self.ui_scale)),
             )
         else:
-            wrap_width = max(scale(420, self.ui_scale), event.width - scale(560, self.ui_scale))
+            wrap_width = max(scale(320, self.ui_scale), event.width - art_width - scale(48, self.ui_scale))
             self.home_intro_content.grid_columnconfigure(0, weight=1)
             self.home_intro_content.grid_columnconfigure(1, weight=0)
+            self.home_intro_content.grid_rowconfigure(0, weight=1)
+            self.home_intro_content.grid_rowconfigure(1, weight=0)
             self.home_intro_frame.grid_configure(
                 row=0,
                 column=0,
-                rowspan=2,
-                sticky="nw",
-                padx=(scale(8, self.ui_scale), 0),
+                rowspan=1,
+                sticky="sw",
+                padx=(scale(12, self.ui_scale), scale(16, self.ui_scale)),
+                pady=(0, scale(12, self.ui_scale)),
             )
             self.home_art.grid()
             self.home_art.grid_configure(
                 row=0,
                 column=1,
-                rowspan=2,
-                sticky="ne",
-                padx=(scale(40, self.ui_scale), 0),
-                pady=(scale(120, self.ui_scale), scale(32, self.ui_scale)),
+                rowspan=1,
+                sticky="se",
+                padx=(scale(16, self.ui_scale), scale(12, self.ui_scale)),
+                pady=(0, scale(12, self.ui_scale)),
             )
         self.home_intro_title.configure(wraplength=wrap_width)
         self.home_intro_body.configure(wraplength=wrap_width)
@@ -625,11 +807,34 @@ class NoticeApp:
             self._render_task_card(task, index)
 
         enabled_count = sum(1 for task in self.tasks if task.enabled)
-        state = "已暂停全部提醒" if self.scheduler.paused else "按计划运行中"
-        self.summary_var.set(f"共 {len(self.tasks)} 条提醒，启用 {enabled_count} 条，{state}")
-        self.subtitle_var.set(f"{APP_NAME} · 一个安静的提醒工具")
+        if len(filtered_tasks) != len(self.tasks):
+            self.summary_var.set(f"筛选 {len(filtered_tasks)}/{len(self.tasks)} 条")
+        else:
+            self.summary_var.set(f"共 {len(self.tasks)} 条提醒")
+        self.subtitle_var.set(f"{APP_NAME} · 静水深流，按时而渡")
         if self.pause_button:
-            self.pause_button.set_text("恢复" if self.scheduler.paused else "暂停")
+            if self.scheduler.paused:
+                self.pause_button.set_text("全部暂停")
+                self.pause_button.set_colors(
+                    fill="#fbf3e6",
+                    active_fill="#f7e8d0",
+                    fg="#b58f6d",
+                    outline="#d7c3aa",
+                    dot_color="#d97706",
+                )
+            else:
+                self.pause_button.set_text("全部运行")
+                self.pause_button.set_colors(
+                    fill="#fbf7f1",
+                    active_fill="#eee2d3",
+                    fg=PALETTE.text_secondary,
+                    outline=PALETTE.border,
+                    dot_color="#10b981",
+                )
+        if self.filter_btn:
+            self.filter_btn.configure(
+                fg=PALETTE.accent_text if self.filter_type != "all" else PALETTE.text_secondary
+            )
         if self.empty_label:
             if filtered_tasks:
                 self.empty_label.place_forget()
@@ -639,21 +844,34 @@ class NoticeApp:
 
     def _refresh_clock(self) -> None:
         # 每次读取系统时间，跨日、休眠恢复和校时后都显示当前值。
-        now = datetime.now()
-        weekday = "一二三四五六日"[now.weekday()]
-        self.today_var.set(f"{now:%Y.%m.%d}  周{weekday}\n{now:%H:%M:%S}")
-        self._drain_live_info()
-        self._refresh_live_info(now)
-        self._clock_after_id = self.root.after(1000, self._refresh_clock)
+        # 刷新体里任何一步抛错都要先把下一次刷新挂回去：这条 1 秒时钟链一断，
+        # 天气、农历回填和跨日刷新就永久停摆。
+        try:
+            now = datetime.now()
+            weekday = "一二三四五六日"[now.weekday()]
+            self.today_var.set(f"{now:%Y.%m.%d} 周{weekday} {now:%H:%M:%S}")
+            if self._display_day != now.date():
+                self._display_day = now.date()
+                self._refresh_ui()
+            self._drain_live_info()
+            self._refresh_live_info(now)
+        finally:
+            self._clock_after_id = self.root.after(1000, self._refresh_clock)
 
     def _refresh_live_info(self, now: datetime) -> None:
         # 天气展示后台线程拉到的结果，数据是否过期由 Weather.display 统一判定。
         if self._weather is not None:
-            self.weather_var.set(self._weather.display(now))
+            text = self._weather.display(now)
+            if self._weather_failed:
+                text += "\n更新失败，稍后重试"
+            self.weather_var.set(text)
         elif not self._weather_failed:
             self.weather_var.set("天气获取中…")
-        if now.date() != self._lunar_day:
-            self._lunar_day = now.date()
+        if (now.date() != self._lunar_day and self._lunar_pending is None
+                and time.monotonic() >= self._lunar_retry_at):
+            self._lunar_pending = now.date()
+            self.lunar_var.set("农历获取中…")
+            self.ganzhi_var.set("")
             self._refresh_lunar_async(now.date())
 
     def _start_live_info(self) -> None:
@@ -685,9 +903,12 @@ class NoticeApp:
         self._weather_failed = False
         self._weather = weather
         self.weather_var.set(weather.display(datetime.now()))
+        self.weather_meta_var.set(weather.location)
         self._schedule_weather_refresh(WEATHER_REFRESH_SECONDS)
 
     def _schedule_weather_refresh(self, delay: int) -> None:
+        if self._weather_after_id is not None:
+            self.root.after_cancel(self._weather_after_id)
         self._weather_after_id = self.root.after(delay * 1000, self._refresh_weather)
 
     def _refresh_lunar_async(self, day: date) -> None:
@@ -696,12 +917,23 @@ class NoticeApp:
                 month_day, ganzhi = lunar_date(day)
             except Exception as exc:
                 logging.getLogger(__name__).info("农历获取失败：%s", exc)
-                return
-            self._live_info_queue.put(("lunar", (month_day, ganzhi)))
+                month_day, ganzhi = None, None
+            self._live_info_queue.put(("lunar", (day, month_day, ganzhi)))
 
         threading.Thread(target=worker, daemon=True, name="live-info-lunar").start()
 
-    def _apply_lunar(self, month_day: str, ganzhi: str) -> None:
+    def _apply_lunar(self, day: date, month_day: str | None, ganzhi: str | None) -> None:
+        self._lunar_pending = None
+        if day != datetime.now().date():
+            self._lunar_retry_at = 0.0
+            return
+        if month_day is None or ganzhi is None:
+            self._lunar_retry_at = time.monotonic() + LUNAR_RETRY_SECONDS
+            self.lunar_var.set("农历获取失败，稍后重试")
+            self.ganzhi_var.set("")
+            return
+        self._lunar_day = day
+        self._lunar_retry_at = 0.0
         self.lunar_var.set(month_day)
         self.ganzhi_var.set(ganzhi)
 
@@ -714,8 +946,12 @@ class NoticeApp:
                 return
             if kind == "weather":
                 self._apply_weather(payload)
-            else:
+            elif kind == "lunar":
                 self._apply_lunar(*payload)
+            else:
+                # 消息类型在这里显式匹配：未知类型丢弃并留痕，
+                # 不能沿用“不是天气就是农历”的假设去解包，否则会把时间链带崩。
+                logging.getLogger(__name__).warning("忽略未知的实时信息消息：%s", kind)
 
     def _render_task_card(self, task: Task, index: int) -> None:
         if not self.scroll_frame:
@@ -725,20 +961,44 @@ class NoticeApp:
         is_effectively_active = task.enabled and not self.scheduler.paused
         title_fg = PALETTE.text_primary if is_effectively_active else PALETTE.text_muted
         desc_fg = PALETTE.text_secondary if is_effectively_active else PALETTE.text_muted
-        icon_fg = PALETTE.accent_text if is_effectively_active else PALETTE.text_muted
+
+        if is_selected:
+            time_fg = "#b58f6d"
+            badge_bg = "#f4e8dc"
+            badge_fg = "#a06c3f"
+            sep_bg = "#d7c3aa"
+        elif is_effectively_active:
+            time_fg = PALETTE.text_primary
+            badge_bg = "#f4f1ec"
+            badge_fg = "#756960"
+            sep_bg = PALETTE.border_soft
+        else:
+            time_fg = PALETTE.text_muted
+            badge_bg = "#eeeae3"
+            badge_fg = PALETTE.text_muted
+            sep_bg = PALETTE.border_soft
+
         if self.scheduler.paused and task.enabled:
             status_text = "暂停"
+            status_bg = "#fbf3e6"
+            status_fg = "#b58f6d"
+        elif task.enabled:
+            status_text = "启用"
+            status_bg = "#edf6ee"
+            status_fg = "#2e7d32"
         else:
-            status_text = "启用" if task.enabled else "停用"
-        status_fg = PALETTE.accent_text if is_effectively_active else PALETTE.text_muted
-        card_height = scale(132, self.ui_scale)
+            status_text = "停用"
+            status_bg = "#f4f1ec"
+            status_fg = PALETTE.text_muted
+
+        card_height = scale(116, self.ui_scale)
         description_width = scale(210, self.ui_scale)
         card_shell = RoundedFrame(
             self.scroll_frame,
             radius=scale(12, self.ui_scale),
-            padding=scale(8, self.ui_scale),
+            padding=scale(10, self.ui_scale),
             fill=bg,
-            outline=PALETTE.border if is_selected else PALETTE.border_soft,
+            outline="#d7c3aa" if is_selected else PALETTE.border_soft,
             shadow=is_selected,
             bg=PALETTE.card_bg,
             height=card_height,
@@ -746,75 +1006,98 @@ class NoticeApp:
         )
         card = card_shell.content
         card_shell.grid(row=index, column=0, sticky="ew", pady=(0, scale(10, self.ui_scale)))
+
+        card.grid_columnconfigure(0, weight=0, minsize=scale(68, self.ui_scale))
+        card.grid_columnconfigure(1, weight=0)
         card.grid_columnconfigure(2, weight=1, minsize=description_width)
         card.grid_columnconfigure(3, weight=0)
         card.grid_columnconfigure(4, weight=0)
+        card.grid_rowconfigure(0, weight=0)
         card.grid_rowconfigure(1, weight=1)
+        card.grid_rowconfigure(2, weight=0)
         self.scroll_frame.grid_columnconfigure(0, weight=1)
 
-        icon = tk.Label(
-            card,
-            text=self._task_icon(task),
-            bg=bg,
-            fg=icon_fg,
-            font=font(self.font_family_var.get(), 14, self.ui_scale),
-        )
-        icon.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(0, scale(10, self.ui_scale)), pady=(scale(8, self.ui_scale), 0))
-        time_box = tk.Frame(card, bg=bg)
-        time_box.grid(row=0, column=1, rowspan=2, sticky="nw", padx=(0, scale(14, self.ui_scale)), pady=(scale(5, self.ui_scale), 0))
+        time_box = tk.Frame(card, bg=bg, width=scale(68, self.ui_scale))
+        time_box.grid(row=0, column=0, rowspan=3, sticky="ns", padx=(scale(2, self.ui_scale), scale(4, self.ui_scale)), pady=(scale(4, self.ui_scale), scale(4, self.ui_scale)))
+        # 时间和频率作为一个整体占用居中空间，不能把两个标签直接堆在顶端。
+        time_group = tk.Frame(time_box, bg=bg)
+        time_group.pack(expand=True, fill=tk.X)
+
         time_label = tk.Label(
-            time_box,
+            time_group,
             text=self._task_time(task),
             bg=bg,
-            fg=desc_fg,
-            font=font(self.font_family_var.get(), 10, self.ui_scale),
+            fg=time_fg,
+            font=font(self.font_family_var.get(), 14, self.ui_scale, "bold"),
+            anchor="center",
+            justify=tk.CENTER,
         )
-        time_label.pack(anchor="w")
-        tk.Label(
-            time_box,
-            text=self._task_time(task),
-            bg=bg,
-            fg=PALETTE.text_muted,
+        time_label.pack(anchor="center", fill=tk.X)
+
+        badge_label = tk.Label(
+            time_group,
+            text=self._task_badge_text(task),
+            bg=badge_bg,
+            fg=badge_fg,
             font=font(self.font_family_var.get(), 8, self.ui_scale),
-        ).pack(anchor="w")
+            padx=scale(6, self.ui_scale),
+            pady=scale(1, self.ui_scale),
+            anchor="center",
+            justify=tk.CENTER,
+        )
+        badge_label.pack(anchor="center", pady=(scale(4, self.ui_scale), 0))
+
+        sep = tk.Frame(card, bg=sep_bg, width=1)
+        sep.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(scale(4, self.ui_scale), scale(12, self.ui_scale)), pady=(scale(4, self.ui_scale), scale(4, self.ui_scale)))
+
         title_label = tk.Label(
             card,
             text=task.title,
             bg=bg,
             fg=title_fg,
-            font=font(self.font_family_var.get(), 12, self.ui_scale, "bold"),
+            font=font(self.font_family_var.get(), 11, self.ui_scale, "bold"),
             anchor="w",
         )
-        title_label.grid(row=0, column=2, sticky="ew", pady=(scale(5, self.ui_scale), 0), padx=(0, scale(8, self.ui_scale)))
+        title_label.grid(row=0, column=2, sticky="ew", pady=(scale(2, self.ui_scale), 0), padx=(0, scale(6, self.ui_scale)))
+
         desc_label = tk.Label(
             card,
             text=self._describe_card_detail(task),
             bg=bg,
             fg=desc_fg,
             font=font(self.font_family_var.get(), 9, self.ui_scale),
-            wraplength=description_width,
             justify=tk.LEFT,
             anchor="nw",
+            wraplength=description_width,
         )
-        desc_label.grid(row=1, column=2, sticky="new", pady=(scale(4, self.ui_scale), 0), padx=(0, scale(8, self.ui_scale)))
-        card.bind(
+        desc_label.grid(row=1, column=2, sticky="ew", pady=(scale(3, self.ui_scale), 0), padx=(0, scale(6, self.ui_scale)))
+        # 卡片会随窗口宽度伸缩，预览要按描述标签的实际宽度换行；
+        # 固定换行宽度会让超出列宽的正文被无声裁掉，末尾的字连同省略号都看不到。
+        desc_label.bind(
             "<Configure>",
-            lambda event, label=desc_label: label.configure(
-                wraplength=max(scale(210, self.ui_scale), event.width - scale(190, self.ui_scale))
-            ),
+            lambda event, label=desc_label: label.configure(wraplength=event.width),
             add="+",
         )
+        next_run_label = tk.Label(
+            card, text=self._describe_next_run(task), bg=bg, fg=desc_fg,
+            font=font(self.font_family_var.get(), 9, self.ui_scale), anchor="w",
+        )
+        next_run_label.grid(row=2, column=2, columnspan=3, sticky="ew", pady=(0, scale(2, self.ui_scale)))
+
         status_label = tk.Label(
             card,
-            text=status_text,
-            bg=bg,
+            text=f"• {status_text}",
+            bg=status_bg,
             fg=status_fg,
             font=font(self.font_family_var.get(), 8, self.ui_scale),
             cursor="hand2",
+            padx=scale(7, self.ui_scale),
+            pady=scale(2, self.ui_scale),
         )
-        status_label.grid(row=0, column=3, sticky="ne", padx=(scale(4, self.ui_scale), scale(8, self.ui_scale)), pady=(scale(7, self.ui_scale), 0))
+        status_label.grid(row=0, column=3, sticky="ne", padx=(scale(4, self.ui_scale), scale(4, self.ui_scale)), pady=(scale(4, self.ui_scale), 0))
         status_label.bind("<Button-1>", lambda _event, task_id=task.id: self._toggle_task_by_id(task_id))
         status_label.bind("<MouseWheel>", self._scroll_task_list)
+
         action_button = tk.Label(
             card,
             text="⋮",
@@ -822,12 +1105,16 @@ class NoticeApp:
             fg=PALETTE.text_secondary,
             font=font(self.font_family_var.get(), 11, self.ui_scale),
             cursor="hand2",
+            padx=scale(4, self.ui_scale),
+            pady=scale(1, self.ui_scale),
         )
+        action_button.bind("<Enter>", lambda _event, btn=action_button: btn.configure(bg="#f2ede4"))
+        action_button.bind("<Leave>", lambda _event, btn=action_button, b=bg: btn.configure(bg=b))
         action_button.bind("<Button-1>", lambda _event, task_id=task.id: self._open_task_menu(task_id))
-        action_button.grid(row=0, column=4, rowspan=2, sticky="ne", pady=(scale(5, self.ui_scale), 0))
+        action_button.grid(row=0, column=4, sticky="ne", pady=(scale(2, self.ui_scale), 0))
         action_button.bind("<MouseWheel>", self._scroll_task_list)
 
-        for widget in (card_shell, card, icon, time_box, time_label, title_label, desc_label):
+        for widget in (card_shell, card, time_box, time_group, time_label, badge_label, sep, title_label, desc_label, next_run_label):
             widget.bind("<Button-1>", lambda _event, task_id=task.id: self._select_task(task_id))
             widget.bind("<Double-Button-1>", lambda _event, task_id=task.id: self._edit_task_by_id(task_id))
             widget.bind("<MouseWheel>", self._scroll_task_list)
@@ -932,23 +1219,64 @@ class NoticeApp:
         self.toggle_selected_task()
 
     def _visible_tasks(self) -> list[Task]:
+        tasks = self.tasks
+        if self.filter_type == "enabled":
+            tasks = [task for task in tasks if task.enabled]
+        elif self.filter_type == "disabled":
+            tasks = [task for task in tasks if not task.enabled]
+        elif self.filter_type == "recurring":
+            tasks = [task for task in tasks if task.trigger_type != "once"]
+        elif self.filter_type == "once":
+            tasks = [task for task in tasks if task.trigger_type == "once"]
+
         keyword = self.search_var.get().strip()
-        if not keyword or keyword == "搜索提醒":
-            return self.tasks
+        if not keyword or keyword in (SEARCH_PLACEHOLDER, "搜索提醒"):
+            return tasks
         keyword_lower = keyword.lower()
         return [
             task
-            for task in self.tasks
+            for task in tasks
             if keyword_lower in task.title.lower()
             or keyword_lower in (task.body or "").lower()
             or keyword_lower in self._describe_trigger(task).lower()
             or keyword_lower in self._describe_next_run(task).lower()
+            or keyword_lower in self._task_badge_text(task).lower()
         ]
+
+    def _open_filter_menu(self, widget: tk.Widget) -> None:
+        menu = tk.Menu(self.root, tearoff=False)
+        options = [
+            ("all", "全部提醒"),
+            ("enabled", "仅显示启用"),
+            ("disabled", "仅显示停用"),
+            ("recurring", "仅周期提醒"),
+            ("once", "仅单次定时"),
+        ]
+        for key, label in options:
+            prefix = "✓ " if self.filter_type == key else "   "
+            menu.add_command(
+                label=f"{prefix}{label}",
+                command=lambda k=key: self._set_filter_type(k),
+            )
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _set_filter_type(self, filter_type: str) -> None:
+        self.filter_type = filter_type
+        if self.filter_btn:
+            self.filter_btn.configure(
+                fg=PALETTE.accent_text if filter_type != "all" else PALETTE.text_secondary
+            )
+        self._refresh_ui()
 
     def _search_focus_in(self, _event) -> None:
         if self.search_entry is None:
             return
-        if self.search_var.get() == "搜索提醒":
+        if self.search_var.get() in (SEARCH_PLACEHOLDER, "搜索提醒"):
             self.search_var.set("")
         self.search_entry.configure(fg=PALETTE.text_primary)
 
@@ -956,7 +1284,7 @@ class NoticeApp:
         if self.search_entry is None:
             return
         if not self.search_var.get().strip():
-            self.search_var.set("搜索提醒")
+            self.search_var.set(SEARCH_PLACEHOLDER)
             self.search_entry.configure(fg=PALETTE.text_muted)
 
     def _task_icon(self, task: Task) -> str:
@@ -970,38 +1298,69 @@ class NoticeApp:
         }
         return mapping.get(task.trigger_type, "•")
 
+    def _task_badge_text(self, task: Task) -> str:
+        mapping = {
+            "once": "单次",
+            "interval": "固定间隔",
+            "weekly": "按周",
+            "weekly_last_workday": "工作日",
+            "yearly": "按年",
+            "cron": "Cron",
+        }
+        return mapping.get(task.trigger_type, "提醒")
+
     def _task_time(self, task: Task) -> str:
-        config = task.trigger_config
-        if task.trigger_type == "once":
-            return str(config.get("time", "--:--"))[:5]
-        if task.trigger_type in {"weekly", "weekly_last_workday", "yearly"}:
-            hour = int(config.get("hour", 0))
-            minute = int(config.get("minute", 0))
-            return f"{hour:02d}:{minute:02d}"
-        if task.trigger_type == "interval":
-            minutes = int(config.get("minutes", 0))
-            hours = int(config.get("hours", 0))
-            if hours:
-                return f"每 {hours} 小时"
-            if minutes:
-                return f"每 {minutes} 分钟"
+        # 卡片上的时间只是展示：配置被手工改坏时（例如分钟写成 null）退回占位文案，
+        # 一条脏记录不能把整个提醒列表的渲染带崩。
+        config = task.trigger_config if isinstance(task.trigger_config, dict) else {}
+        try:
+            if task.trigger_type == "once":
+                return str(config.get("time", "--:--"))[:5]
+            if task.trigger_type in {"weekly", "weekly_last_workday", "yearly"}:
+                hour = int(config.get("hour", 0))
+                minute = int(config.get("minute", 0))
+                return f"{hour:02d}:{minute:02d}"
+            if task.trigger_type == "interval":
+                minutes = int(config.get("minutes", 0))
+                hours = int(config.get("hours", 0))
+                if hours and minutes:
+                    return f"{hours}h{minutes}m"
+                if hours:
+                    return f"{hours}h"
+                if minutes:
+                    return f"{minutes}m"
+        except (TypeError, ValueError):
+            return "待修复"
         return "提醒"
 
     def _describe_card_detail(self, task: Task) -> str:
-        return f"{self._describe_trigger(task)}\n{self._describe_next_run(task)}"
+        body = task.body.strip() if task.body and task.body.strip() else self._describe_trigger(task)
+        preview = " ".join(body.split())
+        return preview[:30] + "…" if len(preview) > 30 else preview
 
     def _describe_next_run(self, task: Task) -> str:
         if self.scheduler.paused and task.enabled:
-            return "下次提醒：全部提醒已暂停"
+            return "下次：全部已暂停"
         if not task.enabled:
-            return "下次提醒：未启用"
+            return "下次：未启用"
         if not task.next_run:
-            return "下次提醒：暂无"
+            return "下次：暂无"
         try:
             run_at = datetime.fromisoformat(task.next_run)
-            return f"下次提醒：{run_at:%Y-%m-%d %H:%M}"
-        except ValueError:
-            return f"下次提醒：{task.next_run}"
+            today = datetime.now().date()
+            if run_at.date() == today:
+                day_prefix = "今日"
+            elif run_at.date() == today + timedelta(days=1):
+                day_prefix = "明日"
+            elif run_at.year == today.year:
+                day_prefix = f"{run_at.month:02d}-{run_at.day:02d}"
+            else:
+                day_prefix = f"{run_at.year}-{run_at.month:02d}-{run_at.day:02d}"
+            return f"下次：{day_prefix} {run_at.strftime('%H:%M')}"
+        except (ValueError, TypeError):
+            # next_run 直接来自本地文件，可能被写成了数字等非文本值，
+            # 解析不了就原样展示，不能把异常抛给刷新的时钟链。
+            return f"下次：{task.next_run}"
 
     def _schedule_refresh(self) -> None:
         self.root.after(0, self._sync_from_scheduler)
@@ -1025,7 +1384,7 @@ class NoticeApp:
         self.current_quote_index = next_index
         quote_text, source = APP_QUOTES[next_index]
         self.quote_var.set(quote_text)
-        self.quote_source_var.set(f"—— {source}")
+        self.quote_source_var.set(source)
 
     def _start_quote_rotation(self) -> None:
         self.root.after(18000, self._rotate_quote)
@@ -1270,23 +1629,28 @@ class NoticeApp:
         return next((task for task in self.tasks if task.id == self.selected_task_id), None)
 
     def _describe_trigger(self, task: Task) -> str:
-        trigger_name = TRIGGER_TYPES.get(task.trigger_type, task.trigger_type)
-        config = task.trigger_config
-        if task.trigger_type == "once":
-            return f"{trigger_name} · {config.get('date')} {config.get('time')}"
-        if task.trigger_type == "interval":
-            parts = []
-            for key, label in [("weeks", "周"), ("days", "天"), ("hours", "小时"), ("minutes", "分钟"), ("seconds", "秒")]:
-                value = int(config.get(key, 0))
-                if value:
-                    parts.append(f"{value}{label}")
-            return f"每隔 {' '.join(parts)}"
-        if task.trigger_type == "weekly":
-            names = ["一", "二", "三", "四", "五", "六", "日"]
-            weekdays = "".join(names[index] for index in config.get("weekdays", []))
-            return f"每周 周{weekdays} {int(config.get('hour', 0)):02d}:{int(config.get('minute', 0)):02d}"
-        if task.trigger_type == "weekly_last_workday":
-            return f"每周连续工作段最后一天 {int(config.get('hour', 18)):02d}:{int(config.get('minute', 0)):02d}"
-        if task.trigger_type == "yearly":
-            return f"每年 {int(config.get('month', 1)):02d}-{int(config.get('day', 1)):02d} {int(config.get('hour', 0)):02d}:{int(config.get('minute', 0)):02d}"
-        return f"Cron · {config.get('expression', '')}"
+        # 触发方式说明用于卡片预览与搜索匹配：配置被手工改坏时给出修复提示，
+        # 不能让一条脏记录把列表刷新或搜索整体带崩。
+        config = task.trigger_config if isinstance(task.trigger_config, dict) else {}
+        try:
+            trigger_name = TRIGGER_TYPES.get(task.trigger_type, task.trigger_type)
+            if task.trigger_type == "once":
+                return f"{trigger_name} · {config.get('date')} {config.get('time')}"
+            if task.trigger_type == "interval":
+                parts = []
+                for key, label in [("weeks", "周"), ("days", "天"), ("hours", "小时"), ("minutes", "分钟"), ("seconds", "秒")]:
+                    value = int(config.get(key, 0))
+                    if value:
+                        parts.append(f"{value}{label}")
+                return f"每隔 {' '.join(parts)}"
+            if task.trigger_type == "weekly":
+                names = ["一", "二", "三", "四", "五", "六", "日"]
+                weekdays = "".join(names[index] for index in config.get("weekdays", []))
+                return f"每周 周{weekdays} {int(config.get('hour', 0)):02d}:{int(config.get('minute', 0)):02d}"
+            if task.trigger_type == "weekly_last_workday":
+                return f"每周连续工作段最后一天 {int(config.get('hour', 18)):02d}:{int(config.get('minute', 0)):02d}"
+            if task.trigger_type == "yearly":
+                return f"每年 {int(config.get('month', 1)):02d}-{int(config.get('day', 1)):02d} {int(config.get('hour', 0)):02d}:{int(config.get('minute', 0)):02d}"
+            return f"Cron · {config.get('expression', '')}"
+        except (TypeError, ValueError, IndexError, KeyError):
+            return "配置需要修复"

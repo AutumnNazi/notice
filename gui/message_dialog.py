@@ -57,7 +57,7 @@ class MessageDialog(tk.Toplevel):
             radius=scale(14, self.ui_scale),
             padding=scale(20, self.ui_scale),
             fill=PALETTE.card_bg,
-            outline=PALETTE.border_soft,
+            outline=PALETTE.border,
             shadow=False,
             bg=PALETTE.card_bg,
             width=scale(330, self.ui_scale),

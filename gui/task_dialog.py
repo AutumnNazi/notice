@@ -7,7 +7,7 @@ from tkinter import ttk
 from apscheduler.triggers.cron import CronTrigger
 
 from config import TRIGGER_TYPES, WEEKDAY_LABELS
-from core.models import Task
+from core.models import Task, validate_interval_config
 from gui.message_dialog import show_error
 from gui.theme import (
     PALETTE,
@@ -105,7 +105,7 @@ class TaskDialog(tk.Toplevel):
             radius=scale(14, self.ui_scale),
             padding=scale(26, self.ui_scale),
             fill=PALETTE.card_bg,
-            outline=PALETTE.border_soft,
+            outline=PALETTE.border,
             shadow=False,
             bg=PALETTE.card_bg,
             width=scale(420, self.ui_scale),
@@ -367,9 +367,7 @@ class TaskDialog(tk.Toplevel):
                 "minutes": int(self.interval_minutes_var.get() or "0"),
                 "seconds": int(self.interval_seconds_var.get() or "0"),
             }
-            if all(value == 0 for value in values.values()):
-                raise ValueError("循环间隔至少有一项大于 0。")
-            return values
+            return validate_interval_config(values)
         if trigger_type == "weekly":
             weekdays = [value for value, var in self.weekday_vars.items() if var.get()]
             if not weekdays:

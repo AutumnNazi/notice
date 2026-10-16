@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pythoncom
 from win32com.client import Dispatch
 from win32com.propsys import propsys, pscon
 
@@ -26,15 +27,20 @@ class Notifier:
         if Notification is None:
             return
 
-        self._ensure_start_menu_shortcut()
-        toast = Notification(
-            app_id=APP_ID,
-            title=task.title,
-            msg=task.body or APP_NAME,
-            icon=self._toast_image(),
-            duration="long" if task.priority == "high" else "short",
-        )
-        toast.show()
+        # 调度器使用工作线程，COM 必须在实际调用线程初始化并配对释放。
+        pythoncom.CoInitialize()
+        try:
+            self._ensure_start_menu_shortcut()
+            toast = Notification(
+                app_id=APP_ID,
+                title=task.title,
+                msg=task.body or APP_NAME,
+                icon=self._toast_image(),
+                duration="long" if task.priority == "high" else "short",
+            )
+            toast.show()
+        finally:
+            pythoncom.CoUninitialize()
 
     def _ensure_start_menu_shortcut(self) -> None:
         START_MENU_DIR.mkdir(parents=True, exist_ok=True)

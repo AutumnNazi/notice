@@ -2,6 +2,11 @@
 build/
 dist/
 
+# 打包过程产物：_dist_data_preserved 是 build.py 为防覆盖而备份的 data/，
+# 内含用户真实提醒内容，打包中断残留时绝不能入库
+_dist_data_preserved/
+_wake_build/
+
 # Python 缓存
 __pycache__/
 *.pyc

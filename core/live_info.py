@@ -22,6 +22,7 @@ WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 LOCATION_URL = "https://ipwho.is/"
 WEATHER_REFRESH_SECONDS = 600
 WEATHER_RETRY_SECONDS = 60
+LUNAR_RETRY_SECONDS = 60
 WEATHER_MAX_AGE_SECONDS = 3600
 NETWORK_TIMEOUT_SECONDS = 10
 POWERSHELL = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"

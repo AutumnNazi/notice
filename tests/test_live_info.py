@@ -8,6 +8,8 @@ import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,6 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gui.app as app_module
 from core import live_info
 from core.live_info import Weather
+from core.models import Task
+from gui.settings_dialog import SettingsDialog
+from store import TaskStore
 
 
 class WeatherServiceTests(unittest.TestCase):
@@ -129,6 +134,303 @@ class LiveInfoUITests(unittest.TestCase):
         self.assertEqual(self.app.lunar_var.get(), "九月初五")
         self.assertEqual(self.app.ganzhi_var.get(), "丙午年  马年")
 
+    def test_weather_failure_remains_visible_after_clock_refresh(self):
+        self.assertTrue(self.wait_for(lambda: self.app._weather is not None))
+        self.app._live_info_queue.put(("weather", None))
+        self.app._refresh_clock()
+        self.assertIn("失败", self.app.weather_var.get())
+        self.assertIn("18℃", self.app.weather_var.get())
+        self.app._refresh_clock()
+        self.assertIn("失败", self.app.weather_var.get())
+
+    def test_weather_card_shows_city_without_technical_metadata(self):
+        self.assertTrue(self.wait_for(lambda: self.app._weather is not None))
+        self.app._apply_weather(Weather("测试城", "IP 近似定位", 18.0, "多云", self.weather.observed_at))
+        self.app._refresh_clock()
+        labels = "\n".join(str(widget.cget("text")) for widget in self.app.season_card.content.winfo_children())
+        self.assertIn("测试城", labels)
+        self.assertIn("18℃  多云", labels)
+        self.assertEqual(self.app.weather_meta_var.get(), "测试城")
+        for technical_text in ("近似定位", "设备定位", "Open-Meteo", "数据 10-14"):
+            self.assertNotIn(technical_text, labels)
+
+    def test_lunar_failure_retries_and_recovers_on_the_same_day(self):
+        self.assertTrue(self.wait_for(lambda: self.app.lunar_var.get() == "九月初五"))
+        self.app._lunar_day = None
+        with patch.object(app_module, "LUNAR_RETRY_SECONDS", 0.1), \
+             patch.object(app_module, "lunar_date", side_effect=[OSError("日历暂不可用"), ("九月初五", "丙午年  马年")]):
+            self.app._refresh_clock()
+            self.assertTrue(self.wait_for(lambda: "失败" in self.app.lunar_var.get()))
+            self.assertTrue(self.wait_for(lambda: self.app.lunar_var.get() == "九月初五"))
+            self.assertEqual(self.app.ganzhi_var.get(), "丙午年  马年")
+
+    def test_previous_day_lunar_result_does_not_overwrite_current_date(self):
+        self.assertTrue(self.wait_for(lambda: self.app.lunar_var.get() == "九月初五"))
+        self.app._live_info_queue.put(("lunar", (date(2026, 10, 13), "九月初四", "旧年")))
+        self.app._refresh_clock()
+        self.assertEqual(self.app.lunar_var.get(), "九月初五")
+        self.assertEqual(self.app.ganzhi_var.get(), "丙午年  马年")
+
+    def test_stale_weather_and_failure_do_not_look_current(self):
+        self.assertTrue(self.wait_for(lambda: self.app._weather is not None))
+        self.now += timedelta(hours=2)
+        self.app._live_info_queue.put(("weather", None))
+        self.app._refresh_clock()
+        self.assertIn("已过期", self.app.weather_var.get())
+        self.assertIn("失败", self.app.weather_var.get())
+        self.assertNotIn("18℃", self.app.weather_var.get())
+
+    def test_long_body_keeps_next_run_visible(self):
+        self.app.scheduler.paused = False
+        self.app.tasks = [Task(id="long", title="工作汇报", body="项目进度、风险问题及下周安排需要整理后发给项目组。" * 20,
+                              trigger_type="weekly", trigger_config={"weekdays": [0], "hour": 9},
+                              next_run="2026-10-15 09:00:00")]
+        self.app._refresh_ui()
+        self.app.root.update()
+        card = self.app.task_cards["long"].content
+        next_labels = [widget for widget in card.winfo_children()
+                       if isinstance(widget, app_module.tk.Label) and str(widget.cget("text")).startswith("下次：")]
+        self.assertEqual(len(next_labels), 1)
+        label = next_labels[0]
+        self.assertGreaterEqual(label.winfo_height(), label.winfo_reqheight())
+        self.assertLessEqual(label.winfo_y() + label.winfo_height(), card.winfo_height())
+
+    def test_time_and_frequency_are_centered_as_one_group(self):
+        self.app.scheduler.paused = False
+        self.app.root.deiconify()
+        for trigger, config in (("weekly", {"weekdays": [0], "hour": 9}),
+                                ("interval", {"hours": 1, "minutes": 30})):
+            for selected in (True, False):
+                with self.subTest(trigger=trigger, selected=selected):
+                    self.app.tasks = [Task(id="center", title="周报", trigger_type=trigger, trigger_config=config)]
+                    self.app._refresh_ui()
+                    self.app.selected_task_id = "center" if selected else None
+                    for widget in self.app.scroll_frame.winfo_children():
+                        widget.destroy()
+                    self.app._render_task_card(self.app.tasks[0], 0)
+                    self.app.root.update()
+                    card = self.app.task_cards["center"].content
+                    box = card.grid_slaves(row=0, column=0)[0]
+                    labels = []
+
+                    def collect(widget):
+                        if isinstance(widget, app_module.tk.Label):
+                            labels.append(widget)
+                        for child in widget.winfo_children():
+                            collect(child)
+
+                    collect(box)
+                    self.assertEqual(len(labels), 2)
+                    top = min(label.winfo_rooty() for label in labels)
+                    bottom = max(label.winfo_rooty() + label.winfo_height() for label in labels)
+                    self.assertAlmostEqual((top + bottom) / 2, box.winfo_rooty() + box.winfo_height() / 2, delta=1)
+                    for label in labels:
+                        self.assertAlmostEqual(label.winfo_rootx() + label.winfo_width() / 2,
+                                               box.winfo_rootx() + box.winfo_width() / 2, delta=1)
+
+    def _open_font_dropdown(self, dialog):
+        field = dialog.font_box.combobox
+        self.app.root.update()
+        field.event_generate("<Button-1>", x=field.winfo_width() - 5, y=field.winfo_height() // 2)
+        field.event_generate("<ButtonRelease-1>", x=field.winfo_width() - 5, y=field.winfo_height() // 2)
+        self.app.root.update()
+        popup = str(field.tk.call("ttk::combobox::PopdownWindow", field))
+        self.assertTrue(field.tk.call("winfo", "ismapped", popup))
+        return field, popup, popup + ".f.l"
+
+    def test_font_popup_single_click_selects_and_restores_modal_dialog(self):
+        self.app.root.deiconify()
+        dialog = SettingsDialog(self.app.root, font_choices=["Microsoft YaHei UI", "Arial", "SimSun"],
+                                selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                custom_font_dir="", close_action="tray")
+        try:
+            self.app.root.update()
+            field, popup, listbox = self._open_font_dropdown(dialog)
+            target = 1
+            x, y, width, height = field.tk.call(listbox, "bbox", target)
+            field.tk.call("event", "generate", listbox, "<Button-1>", "-x", x + 5, "-y", y + height // 2)
+            field.tk.call("event", "generate", listbox, "<ButtonRelease-1>", "-x", x + 5, "-y", y + height // 2)
+            self.app.root.update()
+            self.assertEqual(dialog.font_family_var.get(), "Arial")
+            self.assertFalse(field.tk.call("winfo", "ismapped", popup))
+            self.assertIs(self.app.root.grab_current(), dialog)
+            dialog._save()
+            self.assertEqual(dialog.result["font_family"], "Arial")
+        finally:
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+    def test_font_dropdown_has_no_extra_search_and_closes_on_escape(self):
+        self.app.root.deiconify()
+        dialog = SettingsDialog(self.app.root, font_choices=["Microsoft YaHei UI", "Arial", "SimSun"],
+                                selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                custom_font_dir="", close_action="tray")
+        try:
+            self.app.root.update()
+            for _ in range(3):
+                field, popup, listbox = self._open_font_dropdown(dialog)
+                self.assertEqual(int(field.tk.call("winfo", "width", popup)), field.winfo_width())
+                classes = []
+
+                def collect(path):
+                    classes.append(str(field.tk.call("winfo", "class", path)))
+                    for child in field.tk.splitlist(field.tk.call("winfo", "children", path)):
+                        collect(str(child))
+
+                collect(popup)
+                self.assertNotIn("Entry", classes)
+                self.assertNotIn("TEntry", classes)
+                field.tk.call("event", "generate", listbox, "<KeyPress-Escape>")
+                self.app.root.update()
+                self.assertFalse(field.tk.call("winfo", "ismapped", popup))
+                self.assertTrue(dialog.winfo_exists())
+                self.assertIs(self.app.root.grab_current(), dialog)
+                self.assertEqual(dialog.font_family_var.get(), "Microsoft YaHei UI")
+        finally:
+            dialog.destroy()
+
+    def test_font_dropdown_outside_click_closes(self):
+        self.app.root.deiconify()
+        dialog = SettingsDialog(self.app.root, font_choices=["Microsoft YaHei UI", "Arial", "SimSun"],
+                                selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                custom_font_dir="", close_action="tray")
+        try:
+            self.app.root.update()
+            field, popup, listbox = self._open_font_dropdown(dialog)
+            field.tk.call("event", "generate", popup, "<Button-1>", "-x", -10, "-y", -10)
+            self.app.root.update()
+            self.assertFalse(field.tk.call("winfo", "ismapped", popup), "点外部后下拉框仍打开")
+            self.assertIs(self.app.root.grab_current(), dialog)
+        finally:
+            dialog.destroy()
+
+    def test_font_arrow_uses_one_flat_field_and_still_opens(self):
+        self.app.root.deiconify()
+        dialog = SettingsDialog(self.app.root, font_choices=["Microsoft YaHei UI", "Arial"],
+                                selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                custom_font_dir="", close_action="tray")
+        try:
+            field = dialog.font_box.combobox
+            style = app_module.ttk.Style(field)
+            layout = style.layout(field.cget("style") or "TCombobox")
+            self.assertEqual(len(layout), 1, "箭头不能使用独立的凸起按钮区域")
+            self.assertEqual(layout[0][0], "Combobox.field")
+            field, popup, listbox = self._open_font_dropdown(dialog)
+            self.assertEqual(int(field.tk.call("winfo", "width", popup)), field.winfo_width())
+            field.tk.call("event", "generate", listbox, "<KeyPress-Escape>")
+            self.app.root.update()
+            self.assertFalse(field.tk.call("winfo", "ismapped", popup))
+        finally:
+            dialog.destroy()
+
+    def test_font_dropdown_closes_on_same_field_click_and_focus_loss(self):
+        self.app.root.deiconify()
+        dialog = SettingsDialog(self.app.root, font_choices=["Microsoft YaHei UI", "Arial", "SimSun"],
+                                selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                custom_font_dir="", close_action="tray")
+        try:
+            for reason in ("same_field", "focus_loss"):
+                with self.subTest(reason=reason):
+                    field, popup, listbox = self._open_font_dropdown(dialog)
+                    if reason == "same_field":
+                        x = field.winfo_rootx() - int(field.tk.call("winfo", "rootx", popup)) + field.winfo_width() // 2
+                        y = field.winfo_rooty() - int(field.tk.call("winfo", "rooty", popup)) + field.winfo_height() // 2
+                        field.tk.call("event", "generate", popup, "<Button-1>", "-x", x, "-y", y)
+                    else:
+                        field.tk.call("event", "generate", listbox, "<FocusOut>")
+                    self.app.root.update()
+                    self.assertFalse(field.tk.call("winfo", "ismapped", popup))
+                    self.assertIs(self.app.root.grab_current(), dialog)
+                    self.assertEqual(dialog.font_family_var.get(), "Microsoft YaHei UI")
+        finally:
+            dialog.destroy()
+
+    def test_font_dropdown_does_not_block_settings_close_or_leave_grab(self):
+        self.app.root.deiconify()
+        errors = []
+        self.app.root.report_callback_exception = lambda *_args: errors.append(str(_args[1]))
+        for reason in ("close_button", "window_close"):
+            with self.subTest(reason=reason):
+                dialog = SettingsDialog(self.app.root, font_choices=["Microsoft YaHei UI", "Arial"],
+                                        selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                        custom_font_dir="", close_action="tray")
+                field, popup, listbox = self._open_font_dropdown(dialog)
+                if reason == "close_button":
+                    # modal 下拉列表先收起；第二次点设置的关闭按钮完成关闭。
+                    field.tk.call("event", "generate", popup, "<Button-1>", "-x", -10, "-y", -10)
+                    self.app.root.update()
+                    close_label = next(widget for widget in dialog.winfo_children()[0].winfo_children()[0].content.winfo_children()
+                                       if isinstance(widget, app_module.tk.Label) and widget.cget("text") == "×")
+                    close_label.event_generate("<Button-1>", x=3, y=3)
+                else:
+                    dialog.tk.call(dialog.protocol("WM_DELETE_WINDOW"))
+                self.app.root.update()
+                self.assertFalse(dialog.winfo_exists())
+                self.assertFalse(self.app.root.tk.call("winfo", "exists", popup))
+                self.assertIsNone(self.app.root.grab_current())
+        self.assertEqual(errors, [])
+
+    def test_font_values_update_without_extra_popup_widgets(self):
+        self.app.root.deiconify()
+        dialog = SettingsDialog(self.app.root, font_choices=["Microsoft YaHei UI", "Arial"],
+                                selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                custom_font_dir="", close_action="tray")
+        try:
+            dialog.font_box.set_values(["Microsoft YaHei UI", "Arial", "SimSun"])
+            field, popup, listbox = self._open_font_dropdown(dialog)
+            self.assertIn("SimSun", field.tk.call(listbox, "get", 0, "end"))
+            field.tk.call("event", "generate", listbox, "<KeyPress-Escape>")
+            self.app.root.update()
+            self.assertEqual(len(dialog.font_box.winfo_children()), 1)
+        finally:
+            dialog.destroy()
+
+    def test_selected_font_is_saved_and_applied_to_main_window(self):
+        self.app.root.deiconify()
+        callback_errors = []
+        self.app.root.report_callback_exception = lambda *_args: callback_errors.append(str(_args[1]))
+        with TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            real_store = TaskStore(Path(directory) / "tasks.json")
+            self.app.store = SimpleNamespace(save_settings=lambda settings: real_store.save_settings(settings, settings_path))
+
+            def choose_font():
+                dialog = next(widget for widget in self.app.root.winfo_children() if isinstance(widget, SettingsDialog))
+                field, popup, listbox = self._open_font_dropdown(dialog)
+                values = list(field.tk.call(listbox, "get", 0, "end"))
+                index = values.index("Arial")
+                field.tk.call(listbox, "see", index)
+                self.app.root.update()
+                x, y, width, height = field.tk.call(listbox, "bbox", index)
+                field.tk.call("event", "generate", listbox, "<Button-1>", "-x", x + 5, "-y", y + height // 2)
+                field.tk.call("event", "generate", listbox, "<ButtonRelease-1>", "-x", x + 5, "-y", y + height // 2)
+                dialog._save()
+
+            self.app.root.after(100, choose_font)
+            self.app.root.after(4000, lambda: [widget.destroy() for widget in self.app.root.winfo_children()
+                                             if isinstance(widget, SettingsDialog)])
+            self.app.open_settings()
+            self.app.root.update()
+            self.assertEqual(callback_errors, [])
+            self.assertEqual(self.app.font_family_var.get(), "Arial")
+            self.assertEqual(real_store.load_settings(settings_path)["font_family"], "Arial")
+            actual = app_module.tkfont.Font(font=self.app.quote_label.cget("font")).actual("family")
+            self.assertEqual(actual, "Arial")
+
+    def test_next_run_changes_from_tomorrow_to_today_at_midnight(self):
+        self.app.scheduler.paused = False
+        self.app.tasks = [Task(id="midnight", title="晨会", trigger_type="weekly",
+                              trigger_config={"weekdays": [0], "hour": 9}, next_run="2026-10-15 09:00:00")]
+        with patch.object(app_module, "date", wraps=date) as calendar:
+            calendar.today.side_effect = lambda: self.now.date()
+            self.app._refresh_ui()
+            self.app.root.update()
+            self.now = datetime(2026, 10, 15, 0, 0, 1)
+            self.assertTrue(self.wait_for(lambda: "00:00:01" in self.app.today_var.get()))
+            labels = [widget.cget("text") for widget in self.app.task_cards["midnight"].content.winfo_children()
+                      if isinstance(widget, app_module.tk.Label)]
+            self.assertTrue(any("下次：今日 09:00" in str(text) for text in labels), labels)
+
     def test_weather_label_is_not_a_fixed_demo_temperature(self):
         self.assertTrue(self.wait_for(lambda: self.app.weather_var.get() == "18℃  多云"))
         labels = []
@@ -149,6 +451,54 @@ class LiveInfoUITests(unittest.TestCase):
                     for timer in self.app.root.tk.call("after", "info")]
         self.assertFalse(any("_refresh_clock" in command for command in commands))
         self.assertFalse(any("_refresh_weather" in command for command in commands))
+
+    def test_window_fits_primary_work_area(self):
+        # 混合 DPI 多显示器回归：窗口必须完整落在主屏工作区内，不被推出屏幕。
+        self.app._primary_work_area = lambda: (1400, 900)
+        self.app._configure_display_metrics()
+        self.app.root.update()
+        width = self.app.root.winfo_width()
+        height = self.app.root.winfo_height()
+        x, y = self.app.root.winfo_rootx(), self.app.root.winfo_rooty()
+        self.assertLessEqual(width, 1400)
+        self.assertLessEqual(height, 900)
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(x + width, 1400)
+        self.assertLessEqual(y + height, 900)
+
+    def test_small_work_area_at_high_dpi_fits_window(self):
+        self.app._primary_work_area = lambda: (1024, 728)
+        self.app._detect_window_dpi = lambda: 144
+        self.app._configure_display_metrics()
+        self.app.root.deiconify()
+        self.app.root.update()
+        self.assertLessEqual(self.app.root.winfo_width(), 1024)
+        self.assertLessEqual(self.app.root.winfo_height(), 728)
+        self.assertLessEqual(self.app.root.winfo_rootx() + self.app.root.winfo_width(), 1024)
+        self.assertLessEqual(self.app.root.winfo_rooty() + self.app.root.winfo_height(), 728)
+
+    def test_quote_does_not_overlap_season_card(self):
+        # 长名言 + 并排布局：名言右缘不得越过时间天气卡左缘（防遮挡回归）。
+        self.app.quote_var.set("长风破浪会有时，直挂云帆济沧海。会当凌绝顶，一览众山小。")
+        self.app.root.update()
+        self.app.root.update_idletasks()
+        quote_right = self.app.quote_label.winfo_rootx() + self.app.quote_label.winfo_width()
+        season_left = self.app.season_card.winfo_rootx()
+        self.assertLessEqual(quote_right, season_left, "名言右缘越过了时间天气卡左缘")
+
+    def test_narrow_content_stacks_season_card_below_quote(self):
+        # 内容区过窄时时间天气卡移到名言下方（堆叠），恢复宽度后回到并排。
+        self.app._resize_quote_layout(SimpleNamespace(width=300))
+        self.assertFalse(self.app._quote_side_by_side)
+        self.assertEqual(self.app.season_card.grid_info()["row"], 1)
+        self.assertEqual(self.app.home_divider.grid_info()["row"], 2)
+        self.assertEqual(self.app.home_intro_content.grid_info()["row"], 3)
+        self.app._resize_quote_layout(SimpleNamespace(width=2000))
+        self.assertTrue(self.app._quote_side_by_side)
+        self.assertEqual(self.app.season_card.grid_info()["row"], 0)
+        self.assertEqual(self.app.home_divider.grid_info()["row"], 1)
+        self.assertEqual(self.app.home_intro_content.grid_info()["row"], 2)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
 from threading import RLock
 from typing import Callable
 
@@ -36,14 +37,21 @@ class TaskScheduler:
             self._scheduler.remove_all_jobs()
             self._tasks = {task.id: task for task in tasks}
             for task in tasks:
-                self._schedule_task(task)
+                try:
+                    self._schedule_task(task)
+                except (ValueError, TypeError, KeyError) as exc:
+                    # 启动时整批载入：某条提醒的触发配置没法排程（例如按周的小时写成 25）时
+                    # 只停用这一条并留痕，同批其它提醒照常注册，程序也照常打得开。
+                    task.enabled = False
+                    task.next_run = None
+                    print(f"[提醒调度] 提醒“{task.title}”的触发配置无法排程，已停用：{exc}", file=sys.stderr)
             self._notify_changed()
 
     def upsert_task(self, task: Task) -> None:
         with self._lock:
-            self._tasks[task.id] = task
-            self._remove_job(task.id)
+            # 先验证并安装新 job，失败时不触碰原任务和原调度。
             self._schedule_task(task)
+            self._tasks[task.id] = task
             self._notify_changed()
 
     def remove_task(self, task_id: str) -> None:
@@ -80,11 +88,16 @@ class TaskScheduler:
 
     def _schedule_task(self, task: Task) -> None:
         if not task.enabled:
+            # 停用中的提醒不排程、也不校验配置：读取时降级出来的坏记录要能被原样保存，
+            # 用户改好并重新启用时才会走到下面的严格校验。
+            self._remove_job(task.id)
             task.next_run = None
             return
+        task.validate()
         if task.trigger_type == "once":
             run_at = datetime.fromisoformat(f"{task.trigger_config['date']}T{task.trigger_config['time']}")
             if run_at <= datetime.now(run_at.tzinfo):
+                self._remove_job(task.id)
                 task.enabled = False
                 task.next_run = None
                 return
@@ -103,18 +116,24 @@ class TaskScheduler:
     def _run_task(self, task_id: str) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
-        if task is None:
-            return
+            if task is None or not task.enabled or self._paused:
+                return
         self.notifier.send(task)
-        if task.trigger_type == "weekly_last_workday" and task.enabled:
-            with self._lock:
-                self._remove_job(task.id)
+        with self._lock:
+            # 发送期间用户可能已编辑或删除提醒，不覆盖新任务的状态与调度。
+            if self._tasks.get(task_id) is not task:
+                return
+            if task.trigger_type == "once":
+                task.enabled = False
+                task.next_run = None
+            elif task.trigger_type == "weekly_last_workday" and task.enabled:
                 self._schedule_task(task)
-        else:
-            task.next_run = self.task_next_run(task_id)
+            else:
+                task.next_run = None if self._paused else self.task_next_run(task_id)
         self._notify_changed()
 
     def _build_trigger(self, task: Task):
+        task.validate()
         config = task.trigger_config
         if task.trigger_type == "once":
             run_at = datetime.fromisoformat(f"{config['date']}T{config['time']}")
@@ -156,13 +175,16 @@ class TaskScheduler:
 
     def _next_weekly_last_workday(self, hour: int, minute: int, second: int) -> datetime:
         now = datetime.now()
-        candidate = self._last_workday_in_week(now, hour, minute, second)
-        if candidate <= now:
-            next_week_anchor = datetime.fromordinal(now.date().toordinal() + 7)
-            candidate = self._last_workday_in_week(next_week_anchor, hour, minute, second)
-        return candidate
+        reference = now
+        # 整周放假没有候选日，跳过该周；仍保留最长连续工作段的业务规则。
+        for _ in range(53):
+            candidate = self._last_workday_in_week(reference, hour, minute, second)
+            if candidate is not None and candidate > now:
+                return candidate
+            reference += timedelta(days=7)
+        raise ValueError("未来一年内没有可用的法定工作日。")
 
-    def _last_workday_in_week(self, reference: datetime, hour: int, minute: int, second: int) -> datetime:
+    def _last_workday_in_week(self, reference: datetime, hour: int, minute: int, second: int) -> datetime | None:
         start = reference.date().fromordinal(reference.date().toordinal() - reference.weekday())
         streaks: list[list[datetime]] = []
         current_streak: list[datetime] = []
@@ -186,7 +208,7 @@ class TaskScheduler:
         if current_streak:
             streaks.append(current_streak)
         if not streaks:
-            raise ValueError(f"{start.isoformat()} 所在周没有可用的法定工作日。")
+            return None
         best_streak = max(streaks, key=lambda streak: (len(streak), streak[-1]))
         return best_streak[-1]
 
