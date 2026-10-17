@@ -10,6 +10,8 @@ _wake_build/
 # Python 缓存
 __pycache__/
 *.pyc
+# 跑 pytest 时生成的用例缓存与上次失败记录
+.pytest_cache/
 
 # IDE
 .idea/

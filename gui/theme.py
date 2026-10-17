@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import dataclass
 from tkinter import ttk
 from typing import Callable, Sequence
@@ -137,6 +138,16 @@ class RoundedFrame(tk.Canvas):
         self.itemconfigure(self._window_id, width=inner_width, height=inner_height)
 
 
+class _Unset:
+    """区分「调用方没传这个参数」与「显式传 None 要求清除」。"""
+
+    def __repr__(self) -> str:  # pragma: no cover - 仅用于调试显示
+        return "<未设置>"
+
+
+_UNSET = _Unset()
+
+
 class PillButton(tk.Canvas):
     def __init__(
         self,
@@ -178,14 +189,41 @@ class PillButton(tk.Canvas):
         self.weight = weight
         self.dot_color = dot_color
         self._hover = False
+        # 声明宽只作下限：文案比它长时按内容撑开，避免文字被右边缘切掉。
+        self._min_width = width
         self.bind("<Configure>", lambda _event: self._draw())
         self.bind("<Enter>", self._enter)
         self.bind("<Leave>", self._leave)
         self.bind("<Button-1>", lambda _event: self.command())
+        self._fit_to_text()
         self._draw()
+
+    def _text_metrics(self) -> tuple[int, int, int]:
+        """返回（圆点半径, 圆点与文字间距, 文字像素宽）。"""
+        btn_font = font(self.family, 10, self.ui_scale, self.weight)
+        font_obj = tkfont.Font(root=self, font=btn_font)
+        dot_r = max(2, int(round(3 * self.ui_scale)))
+        gap = max(3, int(round(6 * self.ui_scale)))
+        return dot_r, gap, font_obj.measure(self.text)
+
+    def _required_width(self) -> int:
+        """把圆点与左右留白算进去后，完整显示当前文案所需的宽度。"""
+        dot_r, gap, text_w = self._text_metrics()
+        # 左右各留一点内边距，免得文字贴着圆角边框。
+        padding = max(4, int(round(8 * self.ui_scale)))
+        if self.dot_color:
+            return dot_r * 2 + gap + text_w + padding * 2
+        return text_w + padding * 2
+
+    def _fit_to_text(self) -> None:
+        """内容比声明宽时撑开控件；比声明窄时保持原宽度，不动既有布局。"""
+        required = self._required_width()
+        if required > self._min_width:
+            self.configure(width=required)
 
     def set_text(self, text: str) -> None:
         self.text = text
+        self._fit_to_text()
         self._draw()
 
     def set_dot_color(self, dot_color: str | None) -> None:
@@ -199,7 +237,7 @@ class PillButton(tk.Canvas):
         active_fill: str | None = None,
         fg: str | None = None,
         outline: str | None = None,
-        dot_color: str | None = None,
+        dot_color: str | None | _Unset = _UNSET,
     ) -> None:
         if fill is not None:
             self.fill = fill
@@ -209,8 +247,10 @@ class PillButton(tk.Canvas):
             self.fg = fg
         if outline is not None:
             self.outline = outline
-        if dot_color is not None:
+        # 允许显式传 None 去掉圆点：圆点会改变所需宽度，所以要按新内容重新贴合。
+        if dot_color is not _UNSET:
             self.dot_color = dot_color
+        self._fit_to_text()
         self._draw()
 
     def _enter(self, _event: tk.Event) -> None:
@@ -238,12 +278,7 @@ class PillButton(tk.Canvas):
         )
         btn_font = font(self.family, 10, self.ui_scale, self.weight)
         if self.dot_color:
-            import tkinter.font as tkfont
-            dot_r = max(2, int(round(3 * self.ui_scale)))
-            gap = max(3, int(round(6 * self.ui_scale)))
-            # 字体测量也绑定本控件所在的解释器：不指定 root 时会挂到进程默认解释器上。
-            font_obj = tkfont.Font(root=self, font=btn_font)
-            text_w = font_obj.measure(self.text)
+            dot_r, gap, text_w = self._text_metrics()
             total_w = dot_r * 2 + gap + text_w
             dot_x = max(dot_r + 2, (width - total_w) // 2 + dot_r)
             dot_y = height // 2
@@ -605,6 +640,33 @@ def font(family: str, size: int, ui_scale: float, weight: str = "normal") -> tup
     return (family, max(1, round(size)), weight)
 
 
+def elide_text(text: str, font_obj: tkfont.Font, max_width: int, *, suffix: str = "…") -> str:
+    """把文本裁进 max_width 像素，末尾用省略号表示还有内容。
+
+    卡片是固定高度的列表行，标题偏长时既不能换行（会把下面的描述挤出去），
+    也不能直接截断——硬截出来的文字看不出被切了，用户会以为标题本来就这么短。
+    """
+    if not text or max_width <= 0:
+        return text
+    if font_obj.measure(text) <= max_width:
+        return text
+
+    suffix_width = font_obj.measure(suffix)
+    if suffix_width > max_width:
+        # 连省略号都放不下：这一格已经窄到没有展示价值，原样交给上层裁剪。
+        return text
+
+    # 二分找能放下的最长前缀，长标题不必逐字测量。
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if font_obj.measure(text[:middle]) + suffix_width <= max_width:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low].rstrip() + suffix
+
+
 def center_to_parent(window: tk.Toplevel | tk.Tk, parent: tk.Misc | None) -> None:
     window.update_idletasks()
     if parent is not None:
@@ -624,6 +686,118 @@ def center_to_parent(window: tk.Toplevel | tk.Tk, parent: tk.Misc | None) -> Non
     x = parent_x + max((parent_width - width) // 2, 0)
     y = parent_y + max((parent_height - height) // 2, 0)
     window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+class SlimScrollbar(tk.Canvas):
+    """细长的圆角滚动条。
+
+    ttk 的 clam 滚动条宽度由内置图片决定，``width`` 选项根本不生效（实测只能得到
+    14px 上下），拿不到想要的 6px。界面其余控件本来就是自绘的，这里也自绘一条，
+    既能统一圆角风格，也方便只在真的需要时才出现。
+
+    对外接口与 ``ttk.Scrollbar`` 一致：接一个 ``command``，并实现 ``set(first, last)``，
+    所以可以直接挂到 Canvas 的 ``yscrollcommand`` 上。
+    """
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        command: Callable[..., None],
+        ui_scale: float,
+        thickness: int | None = None,
+        bg: str | None = None,
+        thumb: str = PALETTE.accent,
+        thumb_active: str = "#c3ab8c",
+    ) -> None:
+        self._thickness = thickness if thickness is not None else scale(6, ui_scale)
+        super().__init__(
+            master,
+            width=self._thickness,
+            bg=bg or PALETTE.card_bg,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.command = command
+        self.ui_scale = ui_scale
+        self.thumb = thumb
+        self.thumb_active = thumb_active
+        self._first = 0.0
+        self._last = 1.0
+        self._grab_offset = 0.0
+        self._dragging = False
+        self._hover = False
+        self.bind("<Configure>", lambda _event: self._draw())
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Enter>", lambda _event: self._draw(hover=True))
+        self.bind("<Leave>", lambda _event: self._draw(hover=False))
+        self._draw()
+
+    # ── 与 ttk.Scrollbar 对齐的接口 ──────────────────────────────────
+    def set(self, first: float | str, last: float | str) -> None:
+        self._first = float(first)
+        self._last = float(last)
+        self._draw()
+
+    def get(self) -> tuple[float, float]:
+        return self._first, self._last
+
+    def _thumb_span(self) -> tuple[float, float, int]:
+        height = max(1, self.winfo_height())
+        top = self._first * height
+        bottom = self._last * height
+        # 内容特别长时滑块会被压成一条线，留一个还抓得住的最小高度。
+        minimum = max(scale(18, self.ui_scale), self._thickness * 3)
+        if bottom - top < minimum:
+            bottom = min(top + minimum, height)
+            top = max(0.0, bottom - minimum)
+        return top, bottom, height
+
+    def _draw(self, hover: bool | None = None) -> None:
+        if hover is not None:
+            self._hover = hover
+        self.delete("thumb")
+        top, bottom, _ = self._thumb_span()
+        if bottom - top < max(2, self._thickness):
+            return
+        draw_round_rect(
+            self,
+            0,
+            top,
+            self._thickness,
+            bottom,
+            self._thickness / 2,
+            fill=self.thumb_active if (self._hover or self._dragging) else self.thumb,
+            outline="",
+            tag="thumb",
+        )
+
+    def _press(self, event: tk.Event) -> None:
+        top, bottom, _ = self._thumb_span()
+        if top <= event.y <= bottom:
+            self._grab_offset = event.y - top
+        else:
+            # 点在滑块之外：先把滑块挪到指针下面，再顺势接着拖，和系统滚动条行为一致。
+            self._grab_offset = (bottom - top) / 2
+            self._move_thumb_to(event.y)
+        self._dragging = True
+        self._draw()
+
+    def _drag(self, event: tk.Event) -> None:
+        if self._dragging:
+            self._move_thumb_to(event.y)
+
+    def _release(self, _event: tk.Event) -> None:
+        self._dragging = False
+        self._draw()
+
+    def _move_thumb_to(self, pointer_y: float) -> None:
+        _, _, height = self._thumb_span()
+        target = pointer_y - self._grab_offset
+        # 滑块顶端像素换回视图比例：moveto 用的是同一套比例语义。
+        self.command("moveto", min(max(target / height, 0.0), 1.0))
 
 
 def enable_window_drag(window: tk.Toplevel, *handles: tk.Widget) -> None:

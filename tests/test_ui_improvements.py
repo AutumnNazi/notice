@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import io
 import json
 import queue
@@ -18,13 +19,24 @@ from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
 from core.models import Task
 from core.live_info import Weather
-from core.scheduler import TaskScheduler
+from core.scheduler import DEFAULT_SNOOZE_MINUTES, SNOOZE_JOB_PREFIX, TaskScheduler
 import core.notifier as notifier_module
 from store import TaskStore
 import gui.app as app_module
-from gui.theme import PALETTE, PillButton
+from gui.theme import PALETTE, PillButton, SlimScrollbar, elide_text, scale
 from gui.task_dialog import TRIGGER_KEY_TO_LABEL, TaskDialog
 from types import SimpleNamespace
+
+
+def _reclaim_idle_tk_interpreters() -> None:
+    """在主线程里回收前面用例遗留的 Tk 解释器。
+
+    启动真实调度器线程的用例必须先做这一步：进程里先前留下的 Tk 解释器如果还没被回收，
+    就可能在线程池的工作线程里被回收，而 Tcl 不允许在非创建线程删除解释器，
+    会直接 abort（Tcl_AsyncDelete: async handler deleted by the wrong thread），
+    整套测试随之崩掉且看不出是哪个用例失败。
+    """
+    gc.collect()
 
 
 class UiImprovementsTests(unittest.TestCase):
@@ -228,6 +240,341 @@ class PauseButtonTests(_RealAppTests):
                 self.app.pause_button.command()
                 self.assertEqual(self.pause_actions, [action], f"按钮写着“{label}”，点下去却做了别的")
 
+    def test_button_wide_enough_for_its_longest_label(self):
+        """按钮宽度必须放得下文案：动作语义的文案比状态语义长，曾被右边缘切掉。"""
+        import tkinter.font as tkfont
+
+        from gui.theme import font as make_font
+
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                self.app.scheduler.paused = paused
+                self.app._refresh_ui()
+                self.app.root.update()
+
+                button = self.app.pause_button
+                label = str(button.text)
+                metrics = tkfont.Font(root=button, font=make_font(button.family, 10, button.ui_scale))
+                text_w = metrics.measure(label)
+                dot_r = max(2, int(round(3 * button.ui_scale)))
+                gap = max(3, int(round(6 * button.ui_scale)))
+                needed = dot_r * 2 + gap + text_w
+                available = max(1, button.winfo_width() or int(button["width"]))
+
+                self.assertGreaterEqual(
+                    available, needed,
+                    f"“{label}”需要 {needed}px，按钮只有 {available}px，文字会被切掉",
+                )
+
+
+class PillButtonSizingTests(unittest.TestCase):
+    """自绘按钮的宽度以声明值为下限，文案更长时按内容撑开。"""
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+
+    def build(self, text: str, width: int, *, dot: bool = False) -> PillButton:
+        button = PillButton(
+            self.root, text, lambda: None,
+            width=width, height=42, family="Microsoft YaHei", ui_scale=1.0,
+            radius=14, dot_color="#10b981" if dot else None,
+        )
+        self.addCleanup(button.destroy)
+        return button
+
+    def test_long_label_is_not_clipped(self):
+        button = self.build("暂停全部提醒", 88, dot=True)
+
+        self.assertGreater(int(button["width"]), 88, "长文案应当把按钮撑开，而不是被切掉")
+
+    def test_short_label_keeps_declared_width(self):
+        """对话框里的短文案按钮宽度是有意设计的，不能被这套逻辑改掉。"""
+        for label in ("取消", "保存", "知道了"):
+            with self.subTest(label=label):
+                button = self.build(label, 112)
+
+                self.assertEqual(int(button["width"]), 112, f"“{label}”不该改变声明宽度")
+
+    def test_set_text_refits_when_label_grows(self):
+        button = self.build("取消", 92)
+        baseline = int(button["width"])
+        button.set_text("打开数据目录")
+
+        self.assertEqual(baseline, 92)
+        self.assertGreater(int(button["width"]), 92, "换成长文案后必须重新贴合宽度")
+
+
+class SlimScrollbarTests(unittest.TestCase):
+    """自绘滚动条：滑块要跟着视图走，并且真的能拖动列表。"""
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.geometry("60x200+80+80")
+        # 滑块几何依赖真实高度，窗口必须先映射出来。
+        self.root.deiconify()
+        self.addCleanup(self.root.destroy)
+        self.calls: list[tuple] = []
+        self.bar = SlimScrollbar(self.root, command=lambda *args: self.calls.append(args), ui_scale=1.0)
+        self.bar.pack(fill="y", expand=True)
+        self.root.update()
+        self.height = self.bar.winfo_height()
+
+    def _thumb(self) -> tuple[int, int, int, int]:
+        items = self.bar.find_withtag("thumb")
+        self.assertTrue(items, "画布上没有滑块")
+        return self.bar.bbox(items[0])
+
+    def test_reported_range_becomes_the_thumb_position(self):
+        self.bar.set(0.0, 0.5)
+        top_half = self._thumb()
+        self.bar.set(0.5, 1.0)
+        bottom_half = self._thumb()
+
+        self.assertGreater(top_half[1], -2)
+        self.assertLess(top_half[3], self.height // 2 + 4, "上半段的范围没有画在上半段")
+        self.assertGreater(bottom_half[1], self.height // 2 - 4, "下半段的范围没有画在下半段")
+
+    def test_get_returns_what_set_received(self):
+        self.bar.set(0.25, 0.75)
+
+        self.assertEqual(self.bar.get(), (0.25, 0.75))
+
+    def test_dragging_the_thumb_asks_the_view_to_move(self):
+        self.bar.set(0.0, 0.5)
+        box = self._thumb()
+
+        self.bar._press(SimpleNamespace(y=(box[1] + box[3]) // 2))
+        self.assertTrue(self.bar._dragging)
+        self.bar._drag(SimpleNamespace(y=0))
+        self.bar._release(SimpleNamespace(y=0))
+
+        self.assertTrue(self.calls, "拖动滑块没有通知视图滚动")
+        self.assertEqual(self.calls[-1], ("moveto", 0.0))
+
+    def test_pressing_below_the_thumb_jumps_there_then_keeps_dragging(self):
+        self.bar.set(0.0, 0.5)
+
+        self.bar._press(SimpleNamespace(y=int(self.height * 0.9)))
+        self.bar._drag(SimpleNamespace(y=int(self.height * 0.9)))
+
+        self.assertTrue(self.calls, "点在滑块之外没有把视图带过去")
+        self.assertGreater(self.calls[-1][1], 0.0)
+
+    def test_very_long_content_keeps_a_grabbable_thumb(self):
+        self.bar.set(0.0, 0.001)
+
+        box = self._thumb()
+
+        self.assertGreaterEqual(box[3] - box[1], scale(18, 1.0), "滑块被压得抓不住")
+
+
+class ElideTextTests(unittest.TestCase):
+    """文本裁剪助手：放得下就原样返回，放不下才截断并补省略号。"""
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.metrics = tkfont.Font(root=self.root, font=("Microsoft YaHei UI", 11, "bold"))
+
+    def test_text_that_fits_is_left_alone(self):
+        text = "周报"
+
+        self.assertEqual(elide_text(text, self.metrics, scale(400, 1.0)), text)
+
+    def test_long_text_is_trimmed_and_marked_with_ellipsis(self):
+        text = "这是一个很长的提醒标题" * 6
+        width = scale(200, 1.0)
+        result = elide_text(text, self.metrics, width)
+
+        self.assertTrue(result.endswith("…"), f"截断后应带省略号，实际是 {result!r}")
+        self.assertLess(len(result), len(text))
+        self.assertTrue(text.startswith(result[:-1]), f"{result!r} 应当是原文本的前缀")
+        self.assertLessEqual(self.metrics.measure(result), width, f"{result!r} 裁剪后仍放不下")
+
+    def test_empty_text_stays_empty(self):
+        self.assertEqual(elide_text("", self.metrics, scale(100, 1.0)), "")
+
+    def test_keeps_original_when_even_the_ellipsis_cannot_fit(self):
+        text = "很长的提醒标题" * 6
+
+        self.assertEqual(elide_text(text, self.metrics, 1), text)
+
+
+class CardTitleElisionTests(_RealAppTests):
+    """卡片是固定高度的列表行，标题放不下时要补省略号，而不是硬截成半句。"""
+
+    def _render_title(self, title: str) -> tuple[tk.Label, tkfont.Font]:
+        self.app.tasks = [
+            Task(id="t1", title=title, body="正文", trigger_type="weekly",
+                 trigger_config={"hour": 9, "minute": 0, "weekdays": [0]}, enabled=True),
+        ]
+        self.app.selected_task_id = "t1"
+        self.app._refresh_ui()
+        self.app.root.update()
+        shell = self.app.scroll_frame.grid_slaves(row=0, column=0)[0]
+        label = shell.content.grid_slaves(row=0, column=2)[0]
+        return label, tkfont.Font(root=label, font=label.cget("font"))
+
+    def test_long_title_is_elided_to_fit_the_column(self):
+        long_title = "每天下午提醒我起来走动一下别老坐着顺便去接杯水再回来"
+        label, metrics = self._render_title(long_title)
+        shown = str(label.cget("text"))
+
+        self.assertNotEqual(shown, long_title, "长标题被原样塞进放不下的列里")
+        self.assertTrue(shown.endswith("…"), f"长标题应带省略号提示还有内容，实际显示 {shown!r}")
+        self.assertLessEqual(
+            metrics.measure(shown), label.winfo_width(),
+            f"{shown!r} 需要 {metrics.measure(shown)}px，列宽只有 {label.winfo_width()}px",
+        )
+
+    def test_short_title_is_shown_whole(self):
+        label, _ = self._render_title("周报")
+
+        self.assertEqual(str(label.cget("text")), "周报", "放得下的标题不该被加省略号")
+
+
+class TaskListScrollbarTests(_RealAppTests):
+    """提醒多到超出可视高度时，列表必须给出看得见的滚动条。"""
+
+    def _render(self, count: int) -> None:
+        self.app.tasks = [
+            Task(id=f"t{i}", title=f"提醒 {i}", body=f"第 {i} 条", trigger_type="weekly",
+                 trigger_config={"hour": 9, "minute": 0, "weekdays": [0]}, enabled=True)
+            for i in range(1, count + 1)
+        ]
+        self.app.selected_task_id = None
+        self.app._refresh_ui()
+        self.app.root.update()
+
+    def test_scrollbar_stays_hidden_while_every_reminder_fits(self):
+        self._render(1)
+
+        self.assertFalse(self.app.task_scrollbar.winfo_ismapped(), "内容没超出却出现了滚动条")
+
+    def test_scrollbar_appears_once_the_list_overflows(self):
+        self._render(12)
+
+        self.assertTrue(self.app.task_scrollbar.winfo_ismapped(), "列表装不下了却没有滚动条")
+
+    def test_shrinking_the_list_to_one_reminder_stops_it_scrolling(self):
+        """提醒由多变少时滚动范围必须跟着缩回去。
+
+        卡片是整批销毁重建的，重建后画布窗口项的实际高度还没缩回，
+        scrollregion 会停在旧值：仅剩的一条会被滚出视区，滚轮也仍然能滚。
+        """
+        self._render(12)
+        canvas = self.app.task_canvas
+        canvas.yview_moveto(1.0)
+        self.app.root.update()
+
+        self.app.tasks = self.app.tasks[:1]
+        self.app.selected_task_id = None
+        self.app._refresh_ui()
+        self.app.root.update()
+
+        first, last = canvas.yview()
+        self.assertAlmostEqual(first, 0.0, places=3, msg="内容已经装得下，列表却还停在下方")
+        self.assertAlmostEqual(last, 1.0, places=3)
+        self.assertFalse(self.app.task_scrollbar.winfo_ismapped(), "只剩一条却还显示滚动条")
+
+    def test_the_wheel_cannot_move_a_list_that_already_fits(self):
+        self._render(1)
+        canvas = self.app.task_canvas
+        before = canvas.yview()
+
+        for _ in range(3):
+            self.app._scroll_task_list(SimpleNamespace(delta=-120))
+        self.app.root.update()
+
+        self.assertEqual(canvas.yview(), before, "内容装得下时滚轮不该让列表移动")
+
+    def test_a_newly_created_reminder_is_brought_into_view(self):
+        """长列表里新建的提醒落在末尾，不滚过去用户会以为没建成功。"""
+        self._render(12)
+        canvas = self.app.task_canvas
+        canvas.yview_moveto(0.0)
+        self.app.root.update()
+
+        new = Task(id="t99", title="新提醒", body="刚建的", trigger_type="weekly",
+                   trigger_config={"hour": 8, "minute": 0, "weekdays": [0]}, enabled=True)
+        self.app.tasks = self.app.tasks + [new]
+        self.app.selected_task_id = new.id
+        self.app._refresh_ui()
+        self.app.root.update()
+        self.app.root.update_idletasks()
+
+        shell = self.app.task_cards[new.id]
+        view_top = canvas.winfo_rooty()
+        view_bottom = view_top + canvas.winfo_height()
+        self.assertGreaterEqual(shell.winfo_rooty(), view_top, "新建的提醒落在视区上方")
+        self.assertLessEqual(
+            shell.winfo_rooty() + shell.winfo_height(), view_bottom,
+            "新建的提醒被建在了视区之外，用户看不到自己刚建的那条",
+        )
+
+    def test_a_plain_refresh_leaves_the_user_scroll_position_alone(self):
+        """没有换选中项时刷新不得把用户滚开的位置拽回去。"""
+        self._render(12)
+        canvas = self.app.task_canvas
+        # 选中末尾那条，再手动滚回顶部：此刻选中项在视区之外，
+        # 这正是「刷新会不会把用户拽回选中项」最容易露馅的状态。
+        self.app.selected_task_id = self.app.tasks[-1].id
+        self.app._refresh_ui()
+        self.app.root.update()
+        canvas.yview_moveto(0.0)
+        self.app.root.update()
+        user_position = canvas.yview()
+        selected = self.app.task_cards[self.app.selected_task_id]
+        view_top = canvas.winfo_rooty()
+        view_bottom = view_top + canvas.winfo_height()
+        self.assertTrue(
+            selected.winfo_rooty() + selected.winfo_height() <= view_top
+            or selected.winfo_rooty() >= view_bottom,
+            "前置条件不成立：选中项应当已经在视区之外",
+        )
+
+        for _ in range(3):
+            self.app._refresh_ui()
+            self.app.root.update()
+
+        self.assertEqual(canvas.yview(), user_position, "刷新把用户滚开的位置拽回去了")
+
+    def test_dragging_the_scrollbar_reaches_the_end_of_the_list(self):
+        self._render(12)
+        bar = self.app.task_scrollbar
+        canvas = self.app.task_canvas
+        canvas.yview_moveto(0.0)
+        self.app.root.update()
+        bar.set(*canvas.yview())
+
+        turned_off = SimpleNamespace(y=0)
+        box = bar.bbox(bar.find_withtag("thumb")[0])
+        bar._press(SimpleNamespace(y=box[3]))  # 抓住滑块下沿往下拖到底
+        bar._drag(SimpleNamespace(y=bar.winfo_height()))
+        bar._release(turned_off)
+        self.app.root.update()
+
+        first, last = canvas.yview()
+        self.assertGreater(first, 0.0, "拖动滑块后列表没有滚动")
+        self.assertAlmostEqual(last, 1.0, places=2, msg="拖到底也没看到列表末尾")
+
+
+class NewTaskShortcutTests(_RealAppTests):
+    """Ctrl+N 是新建提醒的键盘入口，要和按钮走同一条路径。"""
+
+    def test_control_n_is_bound_on_the_main_window(self):
+        self.assertTrue(self.app.root.bind("<Control-n>"), "Ctrl+N 没有绑定到主窗口")
+
+    def test_pressing_control_n_opens_the_new_task_flow(self):
+        with patch.object(self.app, "add_task") as add_task:
+            self.app.root.event_generate("<Control-n>")
+            self.app.root.update()
+
+        add_task.assert_called_once()
+
 
 class _MenuOpeningTests(unittest.TestCase):
     """菜单相关测试的公共夹具：真实 Tk 根窗口 + 最小 NoticeApp 替身。
@@ -308,7 +655,167 @@ class MenuLifetimeTests(_MenuOpeningTests):
         self.assertEqual(after, baseline, "反复打开筛选菜单后 Tcl widget 数量增长")
 
 
+class SnoozeSchedulerTests(unittest.TestCase):
+    """稍后提醒只补发一次通知，不能把提醒本身的调度语义带坏。"""
+
+    def setUp(self):
+        _reclaim_idle_tk_interpreters()
+
+    @staticmethod
+    def _future_once_task(task_id: str = "snz") -> Task:
+        # 排在 1 小时之后：既让任务保持启用，也保证它自己的 job 不会在测试里抢先触发。
+        when = datetime.now() + timedelta(hours=1)
+        return Task(
+            id=task_id, title="周报", body="改写周报了",
+            trigger_type="once",
+            trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()},
+            enabled=True,
+        )
+
+    def test_snooze_notifies_without_disabling_a_one_off_task(self):
+        notifier = MagicMock()
+        fired = Event()
+        scheduler = TaskScheduler(notifier)
+        scheduler._scheduler.add_listener(lambda _event: fired.set(), EVENT_JOB_EXECUTED)
+        scheduler.start()
+        try:
+            task = self._future_once_task()
+            scheduler.upsert_task(task)
+            self.assertTrue(task.enabled)
+
+            # minutes=0 让补发立刻执行，从而跑到真实的「注册 job -> 触发 -> 发通知」路径。
+            self.assertTrue(scheduler.snooze_task(task.id, minutes=0))
+            self.assertTrue(fired.wait(10), "稍后提醒没有触发")
+
+            notifier.send.assert_called_once_with(task)
+            self.assertTrue(task.enabled, "稍后提醒把单次提醒停用了——补发不该消耗提醒本身")
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+    def test_snooze_still_fires_for_a_reminder_that_auto_disabled_itself(self):
+        """单次提醒响过就自动停用，而那一刻的「稍后再说」必须仍然发得出来。"""
+        notifier = MagicMock()
+        fired = Event()
+        scheduler = TaskScheduler(notifier)
+        scheduler._scheduler.add_listener(lambda _event: fired.set(), EVENT_JOB_EXECUTED)
+        scheduler.start()
+        try:
+            task = self._future_once_task()
+            scheduler.upsert_task(task)
+            task.enabled = False  # 已经响过一次，按单次提醒的语义自动停用
+
+            self.assertTrue(scheduler.snooze_task(task.id, minutes=0))
+            self.assertTrue(fired.wait(10), "稍后提醒没有触发")
+
+            notifier.send.assert_called_once_with(task)
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+    def test_snooze_keeps_its_own_job_id_apart_from_the_task(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        try:
+            task = self._future_once_task()
+            scheduler.upsert_task(task)
+            own_next_run = scheduler.task_next_run(task.id)
+
+            self.assertTrue(scheduler.snooze_task(task.id, minutes=5))
+
+            self.assertIsNotNone(scheduler._scheduler.get_job(f"{SNOOZE_JOB_PREFIX}{task.id}"),
+                                 "稍后提醒没有排上")
+            self.assertIsNotNone(scheduler._scheduler.get_job(task.id), "提醒自己的调度被顶掉了")
+            self.assertEqual(scheduler.task_next_run(task.id), own_next_run,
+                             "稍后提醒改动了提醒自己的下次运行时间")
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+    def test_snooze_refuses_a_task_that_does_not_exist(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        try:
+            self.assertFalse(scheduler.snooze_task("这条提醒不存在"))
+            self.assertIsNone(scheduler._scheduler.get_job(f"{SNOOZE_JOB_PREFIX}这条提醒不存在"))
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+    def test_removing_a_task_cancels_its_pending_snooze(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        try:
+            task = self._future_once_task()
+            scheduler.upsert_task(task)
+            self.assertTrue(scheduler.snooze_task(task.id, minutes=5))
+
+            scheduler.remove_task(task.id)
+
+            self.assertIsNone(scheduler._scheduler.get_job(f"{SNOOZE_JOB_PREFIX}{task.id}"),
+                              "提醒都删了，挂起的稍后提醒还会再弹一次")
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+    def test_snooze_stays_silent_while_all_reminders_are_paused(self):
+        notifier = MagicMock()
+        scheduler = TaskScheduler(notifier)
+        scheduler.start()
+        try:
+            task = self._future_once_task()
+            scheduler.upsert_task(task)
+            scheduler.pause_all()
+
+            scheduler._notify(task.id)
+
+            notifier.send.assert_not_called()
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+
+class SnoozeMenuTests(_MenuOpeningTests):
+    """卡片菜单要能安排稍后提醒，并且菜单项真的连到调度器。"""
+
+    LABEL = f"{DEFAULT_SNOOZE_MINUTES} 分钟后再说"
+
+    def _snooze_entry_index(self) -> int:
+        menu = self.app._task_menu
+        labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+        self.assertIn(self.LABEL, labels, f"卡片菜单里没有稍后提醒：{labels}")
+        return labels.index(self.LABEL)
+
+    def _open_menu_with(self, *, paused: bool):
+        task = Task(id="snz", title="周报", trigger_type="weekly",
+                    trigger_config={"hour": 9, "minute": 0, "weekdays": [0]}, enabled=True)
+        self.app._selected_task = lambda: task
+        self.app.scheduler = MagicMock()
+        self.app.scheduler.paused = paused
+        self.app.scheduler.snooze_task.return_value = True
+        self.app._open_task_menu("snz")
+
+    def test_menu_offers_snooze_and_schedules_it(self):
+        with patch.object(app_module, "show_info") as info:
+            self._open_menu_with(paused=False)
+
+            # 光有菜单项不算数，点下去必须真的调到调度器。
+            self.app._task_menu.invoke(self._snooze_entry_index())
+
+        self.app.scheduler.snooze_task.assert_called_once_with("snz")
+        info.assert_called_once()
+        self.assertIn("10 分钟", info.call_args[0][2])
+
+    def test_menu_refuses_snooze_while_all_reminders_are_paused(self):
+        """暂停期间补发不会响，界面必须先说明清楚，别给出落空的成功提示。"""
+        with patch.object(app_module, "show_info") as info:
+            self._open_menu_with(paused=True)
+
+            self.app._task_menu.invoke(self._snooze_entry_index())
+
+        self.app.scheduler.snooze_task.assert_not_called()
+        self.assertIn("暂停", info.call_args[0][2])
+
+
 class CoreRegressionTests(unittest.TestCase):
+    def setUp(self):
+        # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
+        _reclaim_idle_tk_interpreters()
+
     def test_one_off_is_disabled_after_real_execution(self):
         notifier = MagicMock()
         finished = Event()

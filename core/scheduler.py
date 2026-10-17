@@ -14,6 +14,10 @@ from chinese_calendar import is_workday
 from core.models import Task
 from core.notifier import Notifier
 
+# 稍后提醒用的独立 job 前缀：补发的这一次通知不能占用提醒自己的调度槽位。
+SNOOZE_JOB_PREFIX = "snooze:"
+DEFAULT_SNOOZE_MINUTES = 10
+
 
 class TaskScheduler:
     def __init__(self, notifier: Notifier, on_change: Callable[[], None] | None = None) -> None:
@@ -58,6 +62,8 @@ class TaskScheduler:
         with self._lock:
             self._tasks.pop(task_id, None)
             self._remove_job(task_id)
+            # 连挂起的「稍后提醒」一起撤掉，否则删掉提醒后还会再弹一次。
+            self._remove_job(self._snooze_job_id(task_id))
             self._notify_changed()
 
     def pause_all(self) -> None:
@@ -113,12 +119,35 @@ class TaskScheduler:
         )
         task.next_run = self.task_next_run(task.id)
 
-    def _run_task(self, task_id: str) -> None:
+    def _notify(self, task_id: str) -> Task | None:
+        """定时触发路径：停用中的提醒不发通知，返回实际通知的任务。
+
+        只读任务、不推进任何调度状态，所以 _run_task 可以据此把「发通知」和
+        「推进任务状态」分开；稍后提醒的补发走 _fire_snooze，判据不同，不能共用这里。
+        """
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None or not task.enabled or self._paused:
+                return None
+        self.notifier.send(task)
+        return task
+
+    def _fire_snooze(self, task_id: str) -> None:
+        """稍后提醒的补发路径：用户明确要求再提醒一次，所以不要求提醒仍处于启用状态。
+
+        单次提醒触发后会自动停用，而那一刻恰恰最可能被点「稍后再说」；
+        这里若沿用 _notify 的启用判断，这条补发就永远不会发出来。
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or self._paused:
                 return
         self.notifier.send(task)
+
+    def _run_task(self, task_id: str) -> None:
+        task = self._notify(task_id)
+        if task is None:
+            return
         with self._lock:
             # 发送期间用户可能已编辑或删除提醒，不覆盖新任务的状态与调度。
             if self._tasks.get(task_id) is not task:
@@ -131,6 +160,27 @@ class TaskScheduler:
             else:
                 task.next_run = None if self._paused else self.task_next_run(task_id)
         self._notify_changed()
+
+    def _snooze_job_id(self, task_id: str) -> str:
+        return f"{SNOOZE_JOB_PREFIX}{task_id}"
+
+    def snooze_task(self, task_id: str, *, minutes: int = DEFAULT_SNOOZE_MINUTES) -> bool:
+        """稍后再提醒一次：到点只补发一条通知，不改动提醒自身的周期与启用状态。
+
+        任务不存在时返回 False，让界面能如实说明「这条提醒已经不在了」。
+        """
+        with self._lock:
+            if task_id not in self._tasks:
+                return False
+            self._scheduler.add_job(
+                self._fire_snooze,
+                trigger=DateTrigger(run_date=datetime.now() + timedelta(minutes=minutes)),
+                id=self._snooze_job_id(task_id),
+                args=[task_id],
+                replace_existing=True,
+                misfire_grace_time=30,
+            )
+        return True
 
     def _build_trigger(self, task: Task):
         task.validate()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import logging
-import os
 import queue
 import random
 import sys
@@ -25,12 +24,12 @@ from core.live_info import LUNAR_RETRY_SECONDS, WEATHER_REFRESH_SECONDS, WEATHER
 from core.models import Task
 from core.notifier import Notifier
 from core.quotes import APP_QUOTES
-from core.scheduler import TaskScheduler
+from core.scheduler import DEFAULT_SNOOZE_MINUTES, TaskScheduler
 from gui.close_dialog import CloseChoiceDialog
 from gui.message_dialog import ask_yes_no, show_error, show_info
 from gui.settings_dialog import SettingsDialog
 from gui.task_dialog import TaskDialog
-from gui.theme import PALETTE, PillButton, RoundedFrame, apply_ttk_theme, font, scale
+from gui.theme import PALETTE, PillButton, RoundedFrame, SlimScrollbar, apply_ttk_theme, elide_text, font, scale
 from gui.tray import TrayController
 from single_instance import stop_helper
 from store import TaskStore
@@ -105,6 +104,11 @@ class NoticeApp:
         self._filter_menu: tk.Menu | None = None
         self.filter_type: str = "all"
         self.task_canvas: tk.Canvas | None = None
+        # 列表滚动范围的重算句柄：卡片整批重建后要等布局稳定再算一次。
+        self._scroll_sync_id: str | None = None
+        # 需要在滚动范围重算之后带进视野的卡片，以及上次已经带过的选中项。
+        self._pending_into_view: str | None = None
+        self._last_scrolled_selection: str | None = None
         self.shell: tk.Frame | None = None
         self.left_panel: tk.Frame | None = None
         self.home_intro_content: tk.Frame | None = None
@@ -144,26 +148,9 @@ class NoticeApp:
         self._set_window_icons()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_requested)
+        # 桌面提醒里最常用的动作是新建，给一个不依赖鼠标位置的入口。
+        self.root.bind("<Control-n>", self._on_new_task_shortcut)
         self.tray.start()
-
-        # [TEMP-DEBUG] 布局诊断，验证后删除
-        if os.environ.get("NOTICE_DEBUG_LAYOUT"):
-            self._debug_dump_count = 0
-            self._debug_dump_tick()
-
-    def _debug_dump_tick(self) -> None:
-        # [TEMP-DEBUG] 布局诊断，验证后删除
-        path = Path(os.environ["NOTICE_DEBUG_LAYOUT"])
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"tick={self._debug_dump_count} ui_scale={self.ui_scale} last_dpi={self._last_dpi} "
-                         f"root={self.root.winfo_width()}x{self.root.winfo_height()} "
-                         f"root_xy=({self.root.winfo_rootx()},{self.root.winfo_rooty()}) "
-                         f"fpixels={self.root.winfo_fpixels('1i'):.1f} "
-                         f"scaling={self.root.tk.call('tk', 'scaling')} "
-                         f"season={'None' if self.season_card is None else f'{self.season_card.winfo_rootx()},{self.season_card.winfo_rooty()} {self.season_card.winfo_width()}x{self.season_card.winfo_height()} mapped={self.season_card.winfo_ismapped()}'}\n")
-        self._debug_dump_count += 1
-        if self._debug_dump_count < 20:
-            self.root.after(1000, self._debug_dump_tick)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -281,6 +268,9 @@ class NoticeApp:
         self.search_entry = None
         self.filter_btn = None
         self.task_canvas = None
+        self.task_scrollbar = None
+        # 重建后按新尺寸把当前选中项重新带进视野一次。
+        self._last_scrolled_selection = None
         self.shell = None
         self.left_panel = None
         self.home_intro_content = None
@@ -455,10 +445,7 @@ class NoticeApp:
         canvas = tk.Canvas(list_shell, bg=PALETTE.card_bg, highlightthickness=0, bd=0)
         self.task_canvas = canvas
         self.scroll_frame = tk.Frame(canvas, bg=PALETTE.card_bg)
-        self.scroll_frame.bind(
-            "<Configure>",
-            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
+        self.scroll_frame.bind("<Configure>", lambda _event: self._schedule_scroll_sync())
         canvas_window = canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
         canvas.bind(
             "<Configure>",
@@ -467,6 +454,15 @@ class NoticeApp:
         canvas.grid(row=0, column=0, sticky="nsew")
         canvas.bind("<MouseWheel>", self._scroll_task_list)
         self.scroll_frame.bind("<MouseWheel>", self._scroll_task_list)
+
+        # 滚动条只在内容真的超出可视高度时出现，缺省界面保持原来的干净观感。
+        self.task_scrollbar = SlimScrollbar(
+            list_shell, command=canvas.yview, ui_scale=self.ui_scale, bg=PALETTE.card_bg
+        )
+        self.task_scrollbar.grid(row=0, column=1, sticky="ns", padx=(scale(4, self.ui_scale), 0))
+        self.task_scrollbar.grid_remove()
+        self._scrollbar_shown = False
+        canvas.configure(yscrollcommand=self._on_task_scroll)
 
         self.empty_label = tk.Label(
             list_shell,
@@ -892,6 +888,13 @@ class NoticeApp:
                     else "还没有提醒。\n点左上角新建第一条。"
                 )
                 self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+        # 选中项变了（例如刚新建完）就把它带进视野：长列表里新提醒落在末尾，
+        # 不滚过去用户会以为没建成功。只在选择变化时做，免得每次刷新都跟用户抢滚动位置。
+        if self.selected_task_id and self.selected_task_id != self._last_scrolled_selection:
+            self._last_scrolled_selection = self.selected_task_id
+            self._pending_into_view = self.selected_task_id
+        # 这一轮卡片数量可能变了，滚动范围要跟着重新算，否则会停在旧内容高度上。
+        self._schedule_scroll_sync()
         self.tray.refresh()
 
     def _refresh_clock(self) -> None:
@@ -1112,6 +1115,16 @@ class NoticeApp:
             anchor="w",
         )
         title_label.grid(row=0, column=2, sticky="ew", pady=(scale(2, self.ui_scale), 0), padx=(0, scale(6, self.ui_scale)))
+        # 卡片是固定高度的列表行，标题放不下时不能换行；按当前列宽加省略号收尾，
+        # 免得长标题被硬截成半句、用户还以为标题本来就那么短。
+        title_font_obj = tkfont.Font(root=title_label, font=font(self.font_family_var.get(), 11, self.ui_scale, "bold"))
+        title_label.bind(
+            "<Configure>",
+            lambda event, label=title_label, full=task.title, metrics=title_font_obj: self._elide_card_title(
+                label, full, metrics, event.width
+            ),
+            add="+",
+        )
 
         desc_label = tk.Label(
             card,
@@ -1244,6 +1257,69 @@ class NoticeApp:
         self.selected_task_id = task_id
         self._refresh_ui()
 
+    def _schedule_scroll_sync(self) -> None:
+        # frame 的 <Configure> 在布局刷新之前就触发，此刻读到的还是旧高度，
+        # 所以统一推迟到空闲时按实际尺寸重算，并合并同一批事件只算一次。
+        if self._scroll_sync_id is not None:
+            try:
+                self.root.after_cancel(self._scroll_sync_id)
+            except tk.TclError:
+                pass
+        self._scroll_sync_id = self.root.after_idle(self._sync_task_scrollregion)
+
+    def _sync_task_scrollregion(self) -> None:
+        """按当前卡片内容重算列表的滚动范围。
+
+        卡片是整批销毁重建的，重建后 frame 的高度虽然已经变小，
+        但 <Configure> 早于布局刷新触发，scrollregion 会一直停在旧高度上：
+        提醒删到只剩一条时列表仍然能滚动，仅有的一张卡片还会被滚出视区。
+        """
+        self._scroll_sync_id = None
+        canvas, frame = self.task_canvas, self.scroll_frame
+        if canvas is None or frame is None:
+            return
+        # 用请求高度而不是 winfo_height()：卡片整批重建后，画布窗口项的实际高度
+        # 要等更晚的布局回合才会缩回去，这里读到的仍会是旧内容的高度。
+        canvas.configure(
+            scrollregion=(0, 0, max(1, canvas.winfo_width()), max(1, frame.winfo_reqheight()))
+        )
+        # 滚动范围刚校准，此刻把待带进视野的卡片滚过去最准确。
+        if self._pending_into_view is not None:
+            task_id, self._pending_into_view = self._pending_into_view, None
+            self._scroll_card_into_view(task_id)
+
+    def _scroll_card_into_view(self, task_id: str) -> None:
+        """把指定卡片滚进可视区，已经看得见就不动。"""
+        shell = self.task_cards.get(task_id)
+        canvas, frame = self.task_canvas, self.scroll_frame
+        if shell is None or canvas is None or frame is None:
+            return
+        content = frame.winfo_reqheight()
+        view = canvas.winfo_height()
+        if content <= view:
+            return
+        top = shell.winfo_y()
+        bottom = top + shell.winfo_height()
+        view_top = canvas.yview()[0] * content
+        if top >= view_top and bottom <= view_top + view:
+            return
+        # 优先让整张卡片贴着视区顶部；靠近末尾时退到还能滚到的最远处。
+        target = min(max(top, 0), content - view)
+        canvas.yview_moveto(target / content)
+
+    def _on_task_scroll(self, first: str, last: str) -> None:
+        # canvas 每次视图或滚动范围变化都会回调这里，所以列表增删后能自动重新判断。
+        # 卡片高度是固定的，滚动条出现只会占掉一点宽度、不会改变内容高度，
+        # 因此这里的显隐不会反过来又触发一次判断而形成来回抖动。
+        overflowing = float(first) > 0.0 or float(last) < 1.0
+        if overflowing != self._scrollbar_shown:
+            self._scrollbar_shown = overflowing
+            if overflowing:
+                self.task_scrollbar.grid()
+            else:
+                self.task_scrollbar.grid_remove()
+        self.task_scrollbar.set(first, last)
+
     def _scroll_task_list(self, event) -> str:
         if self.task_canvas is not None:
             self.task_canvas.yview_scroll(int(-event.delta / 120), "units")
@@ -1255,6 +1331,7 @@ class NoticeApp:
         menu = self._reusable_menu("_task_menu")
         menu.delete(0, "end")
         menu.add_command(label="编辑", command=self.edit_selected_task)
+        menu.add_command(label=f"{DEFAULT_SNOOZE_MINUTES} 分钟后再说", command=self.snooze_selected_task)
         menu.add_command(label="停用提醒" if task and task.enabled else "启用提醒", command=self.toggle_selected_task)
         menu.add_command(label="删除", command=self.delete_selected_task)
         try:
@@ -1425,6 +1502,15 @@ class NoticeApp:
             # 解析不了就原样展示，不能把异常抛给刷新的时钟链。
             return f"下次：{task.next_run}"
 
+    def _elide_card_title(self, label: tk.Label, full_title: str, metrics: tkfont.Font, width: int) -> None:
+        # 首帧列宽还没定下来（或窄到放不下省略号）时保持原文案，
+        # 否则标题会先闪成一个省略号，再在窗口布局完成后跳回正文。
+        if width <= metrics.measure("…"):
+            return
+        fitted = elide_text(full_title, metrics, width)
+        if fitted != label.cget("text"):
+            label.configure(text=fitted)
+
     def _schedule_refresh(self) -> None:
         # Tkinter 只允许主线程调用，而调度器的这个回调会从它的工作线程进来。
         # 主线程的调用（用户点暂停、新建、编辑、删除）立刻刷新，保证操作即时可见；
@@ -1528,6 +1614,10 @@ class NoticeApp:
             self.autostart_var.set(desired_autostart)
             self.toggle_autostart()
 
+    def _on_new_task_shortcut(self, _event: tk.Event | None = None) -> None:
+        # 按键事件本来就在主线程，和点“新建提醒”按钮走同一条路径。
+        self.add_task()
+
     def add_task(self) -> None:
         dialog = TaskDialog(self.root)
         self.root.wait_window(dialog)
@@ -1555,6 +1645,26 @@ class NoticeApp:
             except Exception as exc:
                 self.tasks[index] = task
                 show_error(self.root, "编辑提醒", f"保存失败：{exc}")
+
+    def snooze_selected_task(self) -> None:
+        # 这条提醒现在处理不了时，补一次通知就够，不动它本身的周期设置。
+        # 已停用的提醒仍然可以稍后提醒：单次提醒触发后会自行停用，而那时正是最需要补一次的时刻。
+        task = self._selected_task()
+        if not task:
+            return
+        if self.scheduler.paused:
+            # 暂停期间补发不会响；先如实说明，别让成功提示落空。
+            show_info(self.root, "稍后提醒", "全部提醒已暂停，恢复后稍后提醒才会生效。")
+            return
+        try:
+            scheduled = self.scheduler.snooze_task(task.id)
+        except Exception as exc:
+            show_error(self.root, "稍后提醒", f"安排失败：{exc}")
+            return
+        if not scheduled:
+            show_info(self.root, "稍后提醒", "这条提醒已经不在了，没法再提醒。")
+            return
+        show_info(self.root, "稍后提醒", f"{DEFAULT_SNOOZE_MINUTES} 分钟后会再提醒一次“{task.title}”。")
 
     def delete_selected_task(self) -> None:
         task = self._selected_task()
