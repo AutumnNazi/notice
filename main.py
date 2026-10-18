@@ -5,19 +5,18 @@ from config import APP_ID
 
 def _enable_high_dpi() -> None:
     user32 = ctypes.windll.user32
-    shcore = ctypes.windll.shcore
 
     # Windows 10/11: Per-Monitor DPI V2
     try:
-        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        return
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
     except Exception:
         pass
 
     # Windows 8.1
     try:
-        shcore.SetProcessDpiAwareness(2)
-        return
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return
     except Exception:
         pass
 

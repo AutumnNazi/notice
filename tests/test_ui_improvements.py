@@ -999,6 +999,33 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_dpi_setup_uses_api_results_to_choose_fallback(self):
+        import ctypes
+
+        for v2_result, shcore_result, expected in [(1, 0, "v2"), (0, 0, "shcore"), (0, -1, "legacy")]:
+            with self.subTest(expected=expected):
+                windows = MagicMock()
+                windows.user32.SetProcessDpiAwarenessContext.return_value = v2_result
+                windows.shcore.SetProcessDpiAwareness.return_value = shcore_result
+                with patch.object(ctypes, "windll", windows):
+                    import main
+                    windows.reset_mock()
+                    main._enable_high_dpi()
+                self.assertEqual(windows.shcore.SetProcessDpiAwareness.called, expected != "v2")
+                self.assertEqual(windows.user32.SetProcessDPIAware.called, expected == "legacy")
+
+    def test_missing_shcore_dll_does_not_prevent_legacy_dpi_fallback(self):
+        import ctypes
+        import main
+        from unittest.mock import PropertyMock
+
+        windows = MagicMock()
+        windows.user32.SetProcessDpiAwarenessContext.side_effect = AttributeError("V2 unavailable")
+        type(windows).shcore = PropertyMock(side_effect=OSError("shcore unavailable"))
+        with patch.object(ctypes, "windll", windows):
+            main._enable_high_dpi()
+        windows.user32.SetProcessDPIAware.assert_called_once()
+
     def test_pause_after_dispatch_replays_once_reminder_on_resume(self):
         scheduler = TaskScheduler(MagicMock())
         scheduler.start()
