@@ -155,7 +155,7 @@ class Task:
             raise ValueError(f"Unsupported trigger type: {self.trigger_type}")
         if not self.title.strip():
             self.title = DEFAULT_TITLE
-        if self.priority not in {"normal", "high"}:
+        if not isinstance(self.priority, str) or self.priority not in {"normal", "high"}:
             self.priority = "normal"
         if self.trigger_type == "interval":
             validate_interval_config(self.trigger_config)

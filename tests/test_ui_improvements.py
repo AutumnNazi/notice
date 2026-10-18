@@ -1109,6 +1109,104 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_shutdown_does_not_switch_storage_mode_during_job_dispatch(self):
+        from apscheduler.schedulers.base import STATE_STOPPED
+
+        scheduler = TaskScheduler(MagicMock())
+        dispatching, release, stopping = Event(), Event(), Event()
+        errors = []
+        original_lookup = scheduler._scheduler._lookup_executor
+
+        def blocked_lookup(alias):
+            dispatching.set()
+            if not release.wait(3):
+                raise AssertionError("测试没有释放派发线程")
+            return original_lookup(alias)
+
+        def shutdown():
+            stopping.set()
+            scheduler.shutdown()
+
+        def thread_error(args):
+            errors.append(args.exc_value)
+
+        scheduler.start()
+        closer = threading.Thread(target=shutdown)
+        with patch.object(scheduler._scheduler, "_lookup_executor", side_effect=blocked_lookup), \
+             patch.object(threading, "excepthook", thread_error):
+            try:
+                when = datetime.now() + timedelta(seconds=0.1)
+                scheduler.upsert_task(Task(id="shutdown-dispatch", trigger_type="once",
+                                          trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()}))
+                self.assertTrue(dispatching.wait(3))
+                closer.start()
+                self.assertTrue(stopping.wait(3))
+                closer.join(0.1)
+                self.assertNotEqual(scheduler._scheduler.state, STATE_STOPPED,
+                                    "派发仍持有 job store 时，关闭不能切换为 pending 存储模式")
+            finally:
+                release.set()
+                if closer.ident is not None:
+                    closer.join(3)
+                if scheduler._scheduler.running:
+                    scheduler.shutdown()
+            self.assertFalse(closer.is_alive())
+            self.assertEqual(errors, [], "关闭不得让调度线程抛出 JobLookupError")
+
+    def test_shutdown_does_not_wait_for_running_notification(self):
+        entered, release = Event(), Event()
+        scheduler = TaskScheduler(MagicMock())
+
+        def send(_task):
+            entered.set()
+            release.wait(3)
+
+        scheduler.notifier.send.side_effect = send
+        scheduler.start()
+        thread = scheduler._scheduler._thread
+        when = datetime.now() + timedelta(seconds=0.1)
+        task = Task(id="shutdown-live-send", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(task)
+        try:
+            self.assertTrue(entered.wait(3))
+            scheduler.shutdown()
+            self.assertFalse(release.is_set())
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(scheduler._scheduler.running)
+        finally:
+            release.set()
+            if scheduler._scheduler.running:
+                scheduler.shutdown()
+
+    def test_invalid_priority_types_fall_back_and_remain_editable(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        for priority in ({}, [], ["high"], None, 7, "unknown"):
+            with self.subTest(priority=priority):
+                task = Task.from_dict({"title": "优先级容错", "trigger_type": "interval",
+                                       "trigger_config": {"minutes": 1}, "priority": priority}, strict=False)
+                self.assertEqual(task.priority, "normal")
+                self.assertTrue(task.enabled)
+                dialog = TaskDialog(root, task=task)
+                try:
+                    with patch("gui.task_dialog.show_error") as error:
+                        dialog._save()
+                    error.assert_not_called()
+                    self.assertIsNotNone(dialog.result)
+                    self.assertEqual(dialog.result.priority, "normal")
+                finally:
+                    if dialog.winfo_exists():
+                        dialog.destroy()
+
+    def test_known_priorities_keep_their_existing_meaning(self):
+        for priority in ("normal", "high"):
+            task = Task.from_dict({"title": "合法优先级", "trigger_type": "interval",
+                                   "trigger_config": {"minutes": 1}, "priority": priority}, strict=False)
+            self.assertEqual(task.priority, priority)
+            self.assertTrue(task.enabled)
+
     def test_repeated_icon_generation_reuses_assets_and_repairs_missing_files(self):
         import core.icon_assets as assets
 

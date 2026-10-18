@@ -6,6 +6,7 @@ from threading import RLock
 from typing import Callable, Iterator
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -23,11 +24,29 @@ DEFAULT_SNOOZE_MINUTES = 10
 NOTIFICATION_RETRY_SECONDS = 60
 
 
+class _DispatchSafeScheduler(BackgroundScheduler):
+    def __init__(self) -> None:
+        self._dispatch_lock = RLock()
+        super().__init__()
+
+    def _process_jobs(self):
+        with self._dispatch_lock:
+            return super()._process_jobs()
+
+    def shutdown(self, wait=True):
+        # APScheduler 在停止时先切换存储模式；必须等当前派发结束，避免移除单次 job 报错。
+        with self._dispatch_lock:
+            BlockingScheduler.shutdown(self, wait)
+        # 唤醒后的调度线程仍会进入 _process_jobs，不能持有派发锁等待它退出。
+        self._thread.join()
+        del self._thread
+
+
 class TaskScheduler:
     def __init__(self, notifier: Notifier, on_change: Callable[[], None] | None = None) -> None:
         self.notifier = notifier
         self.on_change = on_change
-        self._scheduler = BackgroundScheduler()
+        self._scheduler = _DispatchSafeScheduler()
         self._lock = RLock()
         self._tasks: dict[str, Task] = {}
         self._snooze_requests: dict[str, object] = {}
