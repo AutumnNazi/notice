@@ -160,7 +160,8 @@ try {
     if isinstance(code, bool) or not isinstance(code, int) or code not in WEATHER_CODES:
         _LOGGER.warning("天气服务返回了未知天气类型：code=%r", code)
         raise ValueError("天气服务返回了未知天气类型")
-    if payload.get("current_units", {}).get("temperature_2m") != "°C":
+    units = payload.get("current_units")
+    if not isinstance(units, dict) or units.get("temperature_2m") != "°C":
         _LOGGER.warning("天气服务返回了不支持的温度单位：current_units=%r",
                         payload.get("current_units"))
         raise ValueError("天气服务返回了不支持的温度单位")
@@ -182,8 +183,13 @@ $year = $calendar.GetYear($day);
 @{month=$calendar.GetMonth($day); day=$calendar.GetDayOfMonth($day);
   leap=$calendar.GetLeapMonth($year); cycle=$calendar.GetSexagenaryYear($day)} | ConvertTo-Json -Compress;
 """ % day.isoformat())
-    month, lunar_day, leap, cycle = (int(data[key]) for key in ("month", "day", "leap", "cycle"))
-    if not (1 <= month <= 13 and 1 <= lunar_day <= 30 and 0 <= leap <= 13 and 1 <= cycle <= 60):
+    values = [data.get(key) for key in ("month", "day", "leap", "cycle")]
+    if any(type(value) is not int for value in values):
+        _LOGGER.warning("系统农历数据无效：日期=%s 返回值=%s", day.isoformat(), data)
+        raise ValueError("系统农历数据无效")
+    month, lunar_day, leap, cycle = values
+    if not (1 <= month <= (13 if leap else 12) and 1 <= lunar_day <= 30
+            and (leap == 0 or 2 <= leap <= 13) and 1 <= cycle <= 60):
         _LOGGER.warning("系统农历数据无效：日期=%s 返回值=%s", day.isoformat(), data)
         raise ValueError("系统农历数据无效")
     is_leap = leap > 0 and month == leap

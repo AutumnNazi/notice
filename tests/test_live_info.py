@@ -68,6 +68,47 @@ class WeatherServiceTests(unittest.TestCase):
         weather = Weather("城市", "设备定位", 20, "晴", self.now)
         self.assertIn("已过期", weather.display(self.now + timedelta(hours=2)))
 
+    def test_invalid_weather_units_have_explicit_validation_error(self):
+        for units in (None, [], "C", {}, {"temperature_2m": "F"}):
+            with self.subTest(units=units):
+                payload = {**self.payload, "current_units": units}
+                with patch.object(live_info, "_powershell_json", return_value={"latitude": 0, "longitude": 0}), \
+                     patch.object(live_info, "_read_json", return_value=payload), \
+                     self.assertLogs("core.live_info", level="WARNING") as diagnostics:
+                    with self.assertRaisesRegex(ValueError, "温度单位"):
+                        live_info.fetch_weather()
+                self.assertIn("current_units", "\n".join(diagnostics.output))
+
+    def test_invalid_lunar_fields_are_rejected_instead_of_truncated(self):
+        valid = {"month": 1, "day": 1, "leap": 0, "cycle": 1}
+        samples = [{**valid, "day": 1.9}, {**valid, "month": True}, {**valid, "cycle": True},
+                   {**valid, "month": 13}, {**valid, "leap": 1}, {**valid, "day": None},
+                   {"month": 1, "day": 1, "leap": 0}]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                with patch.object(live_info, "_powershell_json", return_value=sample), \
+                     self.assertLogs("core.live_info", level="WARNING") as diagnostics:
+                    with self.assertRaisesRegex(ValueError, "农历数据无效"):
+                        live_info.lunar_date(date(2026, 10, 18))
+                self.assertIn("2026-10-18", "\n".join(diagnostics.output))
+
+    def test_valid_lunar_leap_month_boundaries_remain_displayable(self):
+        samples = [({"month": 1, "day": 1, "leap": 0, "cycle": 1}, "正月初一"),
+                   ({"month": 2, "day": 1, "leap": 2, "cycle": 1}, "闰正月初一"),
+                   ({"month": 13, "day": 30, "leap": 13, "cycle": 60}, "闰腊月三十"),
+                   ({"month": 13, "day": 20, "leap": 7, "cycle": 1}, "腊月二十")]
+        for sample, expected in samples:
+            with self.subTest(sample=sample), patch.object(live_info, "_powershell_json", return_value=sample):
+                self.assertEqual(live_info.lunar_date(date(2026, 10, 18))[0], expected)
+
+    def test_valid_negative_temperature_and_celsius_units_are_preserved(self):
+        payload = {**self.payload, "current": {**self.payload["current"], "temperature_2m": -12.5}}
+        with patch.object(live_info, "_powershell_json", return_value={"latitude": 0, "longitude": 0}), \
+             patch.object(live_info, "_read_json", return_value=payload):
+            weather = live_info.fetch_weather()
+        self.assertEqual(weather.temperature, -12.5)
+        self.assertEqual(weather.display(self.now), "-12.5℃  晴")
+
     def test_lunar_dates_using_windows_calendar(self):
         for day, expected in ((date(2026, 10, 14), ("九月初五", "丙午年  马年")),
                               (date(2026, 2, 17), ("正月初一", "丙午年  马年")),
