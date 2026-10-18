@@ -514,7 +514,9 @@ class RoundedSelect(tk.Canvas):
         self.family = family
         self.ui_scale = ui_scale
         self._hover = False
-        self.variable.trace_add("write", lambda *_args: self._draw())
+        self._menu: tk.Menu | None = None
+        self._variable_trace = self.variable.trace_add("write", lambda *_args: self._draw())
+        self.bind("<Destroy>", self._remove_variable_trace)
         self.bind("<Configure>", lambda _event: self._draw())
         self.bind("<Button-1>", self._open_menu)
         self.bind("<Enter>", self._enter)
@@ -562,11 +564,22 @@ class RoundedSelect(tk.Canvas):
         )
 
     def _open_menu(self, _event: tk.Event) -> None:
-        menu = tk.Menu(self, tearoff=False, bg=PALETTE.card_bg, fg=PALETTE.text_primary, activebackground=PALETTE.accent_soft)
+        if self._menu is None:
+            self._menu = tk.Menu(self, tearoff=False, bg=PALETTE.card_bg, fg=PALETTE.text_primary,
+                                 activebackground=PALETTE.accent_soft)
+        menu = self._menu
+        menu.delete(0, "end")
         for value in self.values:
             menu.add_command(label=value, command=lambda selected=value: self._choose(selected))
-        menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
-        menu.grab_release()
+        try:
+            menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _remove_variable_trace(self, event: tk.Event) -> None:
+        if event.widget is self and self._variable_trace is not None:
+            self.variable.trace_remove("write", self._variable_trace)
+            self._variable_trace = None
 
     def _choose(self, value: str) -> None:
         self.variable.set(value)

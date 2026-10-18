@@ -25,7 +25,7 @@ from core.scheduler import DEFAULT_SNOOZE_MINUTES, SNOOZE_JOB_PREFIX, TaskSchedu
 import core.notifier as notifier_module
 from store import TaskStore
 import gui.app as app_module
-from gui.theme import PALETTE, PillButton, SlimScrollbar, elide_text, scale
+from gui.theme import PALETTE, PillButton, RoundedSelect, SlimScrollbar, elide_text, scale
 from gui.task_dialog import TRIGGER_KEY_TO_LABEL, TaskDialog
 from types import SimpleNamespace
 
@@ -680,6 +680,67 @@ class MenuLifetimeTests(_MenuOpeningTests):
 
         self.assertGreaterEqual(baseline, 1, "菜单没弹出来，说明测试没走到 tk_popup")
         self.assertEqual(after, baseline, "反复打开筛选菜单后 Tcl widget 数量增长")
+
+
+class RoundedSelectLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.variable = tk.StringVar(self.root, value="第一项")
+        self.control = RoundedSelect(self.root, variable=self.variable, values=["第一项", "第二项"],
+                                     width=160, height=34, family="Microsoft YaHei UI", ui_scale=1)
+
+    def test_repeated_popup_reuses_menu_and_updated_options(self):
+        with patch.object(tk.Menu, "tk_popup") as popup:
+            for _ in range(20):
+                self.control._open_menu(None)
+            self.control.set_values(["新选项"])
+            self.control._open_menu(None)
+        menus = [child for child in self.control.winfo_children() if isinstance(child, tk.Menu)]
+        self.assertEqual(len(menus), 1)
+        self.assertEqual(popup.call_count, 21)
+        self.assertEqual(menus[0].index("end"), 0)
+        menus[0].invoke(0)
+        self.assertEqual(self.variable.get(), "新选项")
+
+    def test_destroy_removes_own_trace_but_preserves_other_subscribers(self):
+        calls, errors = [], []
+        self.variable.trace_add("write", lambda *_args: calls.append(self.variable.get()))
+        self.root.report_callback_exception = lambda _type, value, _tb: errors.append(value)
+        self.control.destroy()
+        self.variable.set("第二项")
+        self.assertEqual(errors, [])
+        self.assertEqual(calls, ["第二项"])
+        self.assertEqual(len(self.variable.trace_info()), 1)
+
+    def test_popup_failure_releases_menu_grab(self):
+        with patch.object(tk.Menu, "tk_popup", side_effect=tk.TclError("弹出失败")), \
+             patch.object(tk.Menu, "grab_release") as release:
+            with self.assertRaises(tk.TclError):
+                self.control._open_menu(None)
+        release.assert_called_once()
+
+    def test_parent_destroy_cleans_trace_and_repeated_rebuilds_do_not_accumulate(self):
+        self.control.destroy()
+        for _ in range(12):
+            parent = tk.Frame(self.root)
+            control = RoundedSelect(parent, variable=self.variable, values=["第一项", "第二项"],
+                                    width=160, height=34, family="Microsoft YaHei UI", ui_scale=1)
+            self.assertEqual(len(self.variable.trace_info()), 1)
+            parent.destroy()
+            self.assertEqual(self.variable.trace_info(), [])
+        self.variable.set("第二项")
+
+    def test_choose_still_updates_value_and_calls_callback_once(self):
+        callback = MagicMock()
+        self.control.command = callback
+        with patch.object(tk.Menu, "tk_popup"):
+            self.control._open_menu(None)
+        menu = next(child for child in self.control.winfo_children() if isinstance(child, tk.Menu))
+        menu.invoke(1)
+        self.assertEqual(self.variable.get(), "第二项")
+        callback.assert_called_once_with("第二项")
 
 
 class SnoozeSchedulerTests(unittest.TestCase):
