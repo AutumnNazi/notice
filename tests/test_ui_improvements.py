@@ -1180,6 +1180,44 @@ class CoreRegressionTests(unittest.TestCase):
         app.exit_app.assert_not_called()
         error.assert_called_once()
 
+    def test_delayed_once_job_still_executes_after_grace_window(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        finished = Event()
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+        when = datetime.now() + timedelta(hours=1)
+        task = Task(id="delayed-once", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(task)
+        scheduler._scheduler.modify_job(task.id, next_run_time=datetime.now(scheduler._scheduler.timezone) - timedelta(seconds=35))
+        self.assertTrue(finished.wait(3), "已排程单次任务不应因暂停或休眠超过 30 秒而丢失")
+        scheduler.notifier.send.assert_called_once_with(task)
+        self.assertFalse(task.enabled)
+
+    def test_delayed_snooze_still_executes_without_changing_task(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        finished = Event()
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+        task = Task(id="delayed-snooze", enabled=False)
+        scheduler.upsert_task(task)
+        scheduler.snooze_task(task.id)
+        scheduler._scheduler.modify_job(scheduler._snooze_job_id(task.id),
+                                        next_run_time=datetime.now(scheduler._scheduler.timezone) - timedelta(seconds=35))
+        self.assertTrue(finished.wait(3))
+        scheduler.notifier.send.assert_called_once_with(task)
+        self.assertFalse(task.enabled)
+
+    def test_periodic_jobs_keep_bounded_misfire_policy(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        task = Task(id="periodic-grace", trigger_type="interval", trigger_config={"hours": 1})
+        scheduler.upsert_task(task)
+        self.assertEqual(scheduler._scheduler.get_job(task.id).misfire_grace_time, 30)
+
     def test_one_off_is_disabled_after_real_execution(self):
         notifier = MagicMock()
         finished = Event()

@@ -155,7 +155,8 @@ class TaskScheduler:
             args=[task.id],
             replace_existing=True,
             coalesce=True,
-            misfire_grace_time=30,
+            # 已排好的单次 job 在休眠/暂停恢复后仍需执行；周期任务只合并近期错过的触发。
+            misfire_grace_time=None if isinstance(trigger, DateTrigger) else 30,
         )
         task.next_run = self.task_next_run(task.id)
 
@@ -208,7 +209,7 @@ class TaskScheduler:
                     # 单次 job 已被调度器取走；临时发送失败要重试，不能假装已提醒并停用。
                     self._scheduler.add_job(
                         self._run_task, DateTrigger(run_date=datetime.now() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)),
-                        id=task.id, args=[task.id], replace_existing=True, misfire_grace_time=30,
+                        id=task.id, args=[task.id], replace_existing=True, misfire_grace_time=None,
                     )
                     task.next_run = self.task_next_run(task.id)
             elif task.trigger_type == "weekly_last_workday" and task.enabled:
@@ -236,7 +237,7 @@ class TaskScheduler:
                 id=self._snooze_job_id(task_id),
                 args=[task_id],
                 replace_existing=True,
-                misfire_grace_time=30,
+                misfire_grace_time=None,
             )
         return True
 

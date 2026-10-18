@@ -130,6 +130,16 @@ class LiveInfoUITests(unittest.TestCase):
         self.app.search_var.set("no matching reminder")
         self.assertIn("2026.10.15", self.app.today_var.get())
 
+    def test_tk_callback_exception_is_logged_without_stopping_window(self):
+        def fail():
+            raise ValueError("按钮回调失败")
+
+        with self.assertLogs("gui.app", level="ERROR") as diagnostics:
+            self.app.root.after(0, fail)
+            self.app.root.update()
+        self.assertIn("按钮回调失败", "\n".join(diagnostics.output))
+        self.assertTrue(self.app.root.winfo_exists())
+
     def test_weather_and_lunar_labels_show_live_data(self):
         self.assertTrue(self.wait_for(lambda: self.app.weather_var.get() == "18℃  多云"))
         self.assertEqual(self.app.lunar_var.get(), "九月初五")

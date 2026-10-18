@@ -47,6 +47,7 @@ class NoticeApp:
         register_font_directories(self._font_directories())
 
         self.root = tk.Tk()
+        self.root.report_callback_exception = self._report_callback_exception
         self.ui_scale = 1.0
         self._configure_display_metrics()
         self.root.ui_scale = self.ui_scale
@@ -155,6 +156,10 @@ class NoticeApp:
 
     def run(self) -> None:
         self.root.mainloop()
+
+    def _report_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
+        # Tk 回调异常不会经过 sys.excepthook；窗口化运行也必须留下完整堆栈。
+        logging.getLogger(__name__).error("界面回调失败", exc_info=(exc_type, exc_value, exc_tb))
 
     def _configure_display_metrics(self) -> None:
         self.root.update_idletasks()
