@@ -202,6 +202,75 @@ class AppLoggingTests(unittest.TestCase):
         self.assertNotIn("normal-exit-worker", content)
         self.assertEqual(calls, [RuntimeError, SystemExit])
 
+    def test_unreadable_font_directory_does_not_block_other_directories(self):
+        import ctypes
+        from core.font_manager import register_font_directories
+
+        bad = Path(self._temp.name) / "bad-fonts"
+        good = Path(self._temp.name) / "good-fonts"
+        bad.mkdir()
+        good.mkdir()
+        font = good / "sample.ttf"
+        font.write_bytes(b"test font fixture")
+        original_glob = Path.glob
+
+        def scan(path, pattern):
+            if path == bad:
+                raise PermissionError("字体目录不可读")
+            return original_glob(path, pattern)
+
+        windows = MagicMock()
+        windows.gdi32.AddFontResourceExW.return_value = 1
+        app_logging.setup_logging(self.log_dir)
+        with patch.object(Path, "glob", scan), patch.object(ctypes, "windll", windows):
+            self.assertEqual(register_font_directories([bad, good]), [font])
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn(str(bad), content)
+        self.assertIn("字体目录不可读", content)
+        windows.gdi32.AddFontResourceExW.assert_called_once()
+
+    def test_font_registration_failures_keep_healthy_font_and_log_details(self):
+        import ctypes
+        from core.font_manager import register_font_directory
+
+        directory = Path(self._temp.name) / "fonts"
+        directory.mkdir()
+        files = [directory / name for name in ("a-rejected.ttf", "b-failed.ttf", "c-valid.otf")]
+        for path in files:
+            path.write_bytes(b"test font fixture")
+        windows = MagicMock()
+        windows.gdi32.AddFontResourceExW.side_effect = [0, OSError("字体 API 失败"), 1]
+        windows.user32.SendMessageTimeoutW.side_effect = OSError("广播 API 失败")
+        app_logging.setup_logging(self.log_dir)
+        with patch.object(ctypes, "windll", windows):
+            self.assertEqual(register_font_directory(directory), [files[2]])
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn(str(files[0]), content)
+        self.assertIn(str(files[1]), content)
+        self.assertIn("字体 API 失败", content)
+        self.assertIn("广播 API 失败", content)
+        self.assertEqual(windows.gdi32.AddFontResourceExW.call_count, 3)
+        windows.user32.SendMessageTimeoutW.assert_called_once()
+
+    def test_missing_font_directory_has_no_api_calls_and_failed_broadcast_keeps_font(self):
+        import ctypes
+        from core.font_manager import register_font_directory
+
+        directory = Path(self._temp.name) / "fonts"
+        windows = MagicMock()
+        with patch.object(ctypes, "windll", windows):
+            self.assertEqual(register_font_directory(directory), [])
+            windows.gdi32.AddFontResourceExW.assert_not_called()
+            windows.user32.SendMessageTimeoutW.assert_not_called()
+            directory.mkdir()
+            path = directory / "valid.ttf"
+            path.write_bytes(b"test font fixture")
+            windows.gdi32.AddFontResourceExW.return_value = 1
+            windows.user32.SendMessageTimeoutW.return_value = 0
+            with self.assertLogs("core.font_manager", level="WARNING") as diagnostics:
+                self.assertEqual(register_font_directory(directory), [path])
+            self.assertIn("广播字体更新失败", "\n".join(diagnostics.output))
+
 
 if __name__ == "__main__":
     unittest.main()
