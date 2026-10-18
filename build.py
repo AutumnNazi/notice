@@ -115,7 +115,8 @@ def _preserve_dist_data():
     src = DIR_OUT / "data"
     if src.exists():
         if PRESERVED_DATA.exists():
-            shutil.rmtree(PRESERVED_DATA)
+            # 上次中断的备份可能比当前部分恢复的数据完整，不能先删再复制。
+            raise OSError(f"发现上次保留的数据备份 {PRESERVED_DATA}，请先核对并恢复；当前数据与备份均未改动。")
         shutil.copytree(src, PRESERVED_DATA)
         print("       已保护现有 data/ 目录")
     elif PRESERVED_DATA.exists():

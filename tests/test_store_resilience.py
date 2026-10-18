@@ -386,6 +386,44 @@ class BuildLockProbeTests(unittest.TestCase):
                 self.assertEqual(build.main(), 1)
             self.assertEqual(original.read_bytes(), b"original user data")
 
+    def test_retry_preserve_keeps_existing_backup_and_current_data(self):
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            current = output / "data"
+            current.mkdir(parents=True)
+            (current / "tasks.json").write_bytes(b"partially recovered current data")
+            backup = Path(directory) / "preserved"
+            backup.mkdir()
+            (backup / "tasks.json").write_bytes(b"previous recoverable original")
+            with patch("build.DIR_OUT", output), patch("build.PRESERVED_DATA", backup), \
+                 patch("build.shutil.copytree") as copy:
+                with self.assertRaisesRegex(OSError, "备份"):
+                    build._preserve_dist_data()
+            copy.assert_not_called()
+            self.assertEqual((backup / "tasks.json").read_bytes(), b"previous recoverable original")
+            self.assertEqual((current / "tasks.json").read_bytes(), b"partially recovered current data")
+
+    def test_first_preserve_copies_data_and_missing_output_reuses_backup(self):
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            current = output / "data"
+            current.mkdir(parents=True)
+            (current / "tasks.json").write_bytes(b"original reminders")
+            backup = Path(directory) / "preserved"
+            with patch("build.DIR_OUT", output), patch("build.PRESERVED_DATA", backup):
+                build._preserve_dist_data()
+            self.assertEqual((backup / "tasks.json").read_bytes(), b"original reminders")
+            with patch("build.DIR_OUT", Path(directory) / "missing-output"), patch("build.PRESERVED_DATA", backup):
+                build._preserve_dist_data()
+            self.assertEqual((backup / "tasks.json").read_bytes(), b"original reminders")
+
+    def test_clean_stops_before_deleting_output_when_backup_conflicts(self):
+        with patch("build._preserve_dist_data", side_effect=OSError("存在旧备份")), \
+             patch("build.shutil.rmtree") as remove:
+            with self.assertRaises(OSError):
+                build.clean()
+        remove.assert_not_called()
+
     def test_build_exception_returns_failure_without_running_later_steps(self):
         with patch("build.kill_old", side_effect=OSError("无法停止旧程序")), patch("build.clean") as clean, \
              patch("build.build_main") as main, patch("builtins.input", return_value=""):
