@@ -30,6 +30,7 @@ class TaskScheduler:
         self._scheduler = BackgroundScheduler()
         self._lock = RLock()
         self._tasks: dict[str, Task] = {}
+        self._snooze_requests: dict[str, object] = {}
         self._paused = False
         self._stopping = False
 
@@ -41,6 +42,7 @@ class TaskScheduler:
     def shutdown(self) -> None:
         with self._lock:
             self._stopping = True
+            self._snooze_requests.clear()
         # 不持有任务锁等待调度器退出，避免与尚未结束的发送线程互相等待。
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
@@ -48,6 +50,7 @@ class TaskScheduler:
     def sync_tasks(self, tasks: list[Task]) -> None:
         with self._lock:
             self._scheduler.remove_all_jobs()
+            self._snooze_requests.clear()
             self._tasks = {task.id: task for task in tasks}
             for task in tasks:
                 try:
@@ -74,12 +77,17 @@ class TaskScheduler:
         # 同时锁住 job store，避免回滚窗口内新 job 已被调度线程取走执行。
         with self._lock, self._scheduler._jobstores_lock:
             previous = self._tasks.get(task_id)
+            request = self._snooze_requests.get(task_id)
             state = (previous.enabled, previous.next_run) if previous else None
             jobs = {key: self._scheduler.get_job(key)
                     for key in (task_id, self._snooze_job_id(task_id))}
             try:
                 yield
             except Exception:
+                if request is None:
+                    self._snooze_requests.pop(task_id, None)
+                else:
+                    self._snooze_requests[task_id] = request
                 if previous is None:
                     self._tasks.pop(task_id, None)
                 else:
@@ -105,6 +113,7 @@ class TaskScheduler:
     def remove_task(self, task_id: str, *, notify: bool = True) -> None:
         with self._lock:
             self._tasks.pop(task_id, None)
+            self._snooze_requests.pop(task_id, None)
             self._remove_job(task_id)
             # 连挂起的「稍后提醒」一起撤掉，否则删掉提醒后还会再弹一次。
             self._remove_job(self._snooze_job_id(task_id))
@@ -125,7 +134,7 @@ class TaskScheduler:
             self._refresh_next_runs()
             self._notify_changed()
 
-    def _defer_paused_job(self, task: Task, *, snooze: bool = False) -> None:
+    def _defer_paused_job(self, task: Task, *, snooze: bool = False, request: object | None = None) -> None:
         if not self._paused or self._stopping:
             return
         job_id = self._snooze_job_id(task.id) if snooze else task.id
@@ -134,7 +143,7 @@ class TaskScheduler:
             if self._scheduler.get_job(job_id) is None:
                 self._scheduler.add_job(
                     self._fire_snooze if snooze else self._run_task,
-                    DateTrigger(run_date=datetime.now()), id=job_id, args=[task.id],
+                    DateTrigger(run_date=datetime.now()), id=job_id, args=[task.id, request] if snooze else [task.id],
                     # 恢复可能先于旧 worker 收尾，允许这次不发送的旧调用与补发调用短暂重叠。
                     replace_existing=True, misfire_grace_time=None, max_instances=2,
                 )
@@ -196,7 +205,7 @@ class TaskScheduler:
         self.notifier.send(task)
         return task
 
-    def _fire_snooze(self, task_id: str) -> None:
+    def _fire_snooze(self, task_id: str, request: object | None = None) -> None:
         """稍后提醒的补发路径：用户明确要求再提醒一次，所以不要求提醒仍处于启用状态。
 
         单次提醒触发后会自动停用，而那一刻恰恰最可能被点「稍后再说」；
@@ -206,10 +215,31 @@ class TaskScheduler:
             task = self._tasks.get(task_id)
             if task is None or self._stopping:
                 return
-            if self._paused:
-                self._defer_paused_job(task, snooze=True)
+            if request is None:
+                request = self._snooze_requests.setdefault(task_id, object())
+            if self._snooze_requests.get(task_id) is not request:
                 return
-        self.notifier.send(task)
+            if self._paused:
+                self._defer_paused_job(task, snooze=True, request=request)
+                return
+        try:
+            self.notifier.send(task)
+        except Exception:
+            _LOGGER.exception("提醒“%s”的稍后补发失败", task.title)
+            with self._lock, self._scheduler._jobstores_lock:
+                job_id = self._snooze_job_id(task_id)
+                if (not self._stopping and self._tasks.get(task_id) is task
+                        and self._snooze_requests.get(task_id) is request and self._scheduler.get_job(job_id) is None):
+                    self._scheduler.add_job(
+                        self._fire_snooze,
+                        DateTrigger(run_date=datetime.now() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)),
+                        id=job_id, args=[task_id, request], replace_existing=True, misfire_grace_time=None,
+                    )
+            raise
+        else:
+            with self._lock:
+                if self._snooze_requests.get(task_id) is request:
+                    self._snooze_requests.pop(task_id, None)
 
     def _run_task(self, task_id: str) -> None:
         with self._lock:
@@ -261,14 +291,16 @@ class TaskScheduler:
         with self._lock:
             if self._stopping or task_id not in self._tasks:
                 return False
+            request = object()
             self._scheduler.add_job(
                 self._fire_snooze,
                 trigger=DateTrigger(run_date=datetime.now() + timedelta(minutes=minutes)),
                 id=self._snooze_job_id(task_id),
-                args=[task_id],
+                args=[task_id, request],
                 replace_existing=True,
                 misfire_grace_time=None,
             )
+            self._snooze_requests[task_id] = request
         return True
 
     def _build_trigger(self, task: Task):

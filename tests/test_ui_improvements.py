@@ -765,6 +765,116 @@ class SnoozeSchedulerTests(unittest.TestCase):
         finally:
             scheduler._scheduler.shutdown(wait=True)
 
+    def test_failed_snooze_retries_without_changing_original_schedule(self):
+        notifier = MagicMock()
+        notifier.send.side_effect = OSError("补发失败")
+        finished = Event()
+        scheduler = TaskScheduler(notifier)
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
+        scheduler.start()
+        try:
+            task = self._future_once_task("snooze-retry")
+            scheduler.upsert_task(task)
+            original = scheduler._scheduler.get_job(task.id)
+            scheduler.snooze_task(task.id, minutes=0)
+            self.assertTrue(finished.wait(3))
+            retry = scheduler._scheduler.get_job(scheduler._snooze_job_id(task.id))
+            self.assertIsNotNone(retry, "发送失败后的补发必须保留重试")
+            self.assertIs(scheduler._scheduler.get_job(task.id), original)
+            self.assertTrue(task.enabled)
+            self.assertGreater(retry.next_run_time, datetime.now(retry.next_run_time.tzinfo))
+            notifier.send.side_effect = None
+            finished.clear()
+            scheduler._scheduler.modify_job(retry.id, next_run_time=datetime.now(retry.next_run_time.tzinfo))
+            self.assertTrue(finished.wait(3))
+            self.assertEqual(notifier.send.call_count, 2)
+            self.assertIsNone(scheduler._scheduler.get_job(retry.id))
+            self.assertIs(scheduler._scheduler.get_job(task.id), original)
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+    def test_snooze_failure_does_not_override_delete_shutdown_or_new_request(self):
+        for operation in ("delete", "shutdown", "reschedule"):
+            with self.subTest(operation=operation):
+                scheduler = TaskScheduler(MagicMock())
+                scheduler.start()
+                task = self._future_once_task("snooze-cancel")
+                scheduler.upsert_task(task)
+                expected = []
+
+                def fail_after_change(_task):
+                    if operation == "delete":
+                        scheduler.remove_task(task.id)
+                    elif operation == "shutdown":
+                        scheduler.shutdown()
+                    else:
+                        scheduler.snooze_task(task.id, minutes=5)
+                        expected.append(scheduler._scheduler.get_job(scheduler._snooze_job_id(task.id)))
+                    raise OSError("旧补发失败")
+
+                scheduler.notifier.send.side_effect = fail_after_change
+                try:
+                    with self.assertRaises(OSError):
+                        scheduler._fire_snooze(task.id)
+                    job = scheduler._scheduler.get_job(scheduler._snooze_job_id(task.id))
+                    if expected:
+                        self.assertIs(job, expected[0])
+                    else:
+                        self.assertIsNone(job)
+                finally:
+                    if scheduler._scheduler.running:
+                        scheduler._scheduler.shutdown(wait=True)
+
+    def test_old_snooze_failure_does_not_retry_after_new_request_completed(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        task = self._future_once_task("snooze-generation")
+        scheduler.upsert_task(task)
+        scheduler.snooze_task(task.id, minutes=5)
+        old = scheduler._scheduler.get_job(scheduler._snooze_job_id(task.id))
+        scheduler._remove_job(old.id)
+
+        def fail_after_new_request_completed(_task):
+            scheduler.snooze_task(task.id, minutes=5)
+            new = scheduler._scheduler.get_job(old.id)
+            scheduler._remove_job(new.id)
+            with patch.object(scheduler.notifier, "send"):
+                new.func(*new.args)
+            raise OSError("旧请求延迟失败")
+
+        scheduler.notifier.send.side_effect = fail_after_new_request_completed
+        try:
+            with self.assertRaises(OSError):
+                old.func(*old.args)
+            self.assertIsNone(scheduler._scheduler.get_job(old.id))
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
+    def test_failed_delete_restores_inflight_snooze_retry_identity(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        task = self._future_once_task("snooze-rollback")
+        scheduler.upsert_task(task)
+        scheduler.snooze_task(task.id, minutes=5)
+        old = scheduler._scheduler.get_job(scheduler._snooze_job_id(task.id))
+        scheduler._remove_job(old.id)
+
+        def fail_after_rejected_delete(_task):
+            with self.assertRaises(OSError):
+                with scheduler.task_transaction(task.id):
+                    scheduler.remove_task(task.id, notify=False)
+                    raise OSError("删除保存失败")
+            raise OSError("补发失败")
+
+        scheduler.notifier.send.side_effect = fail_after_rejected_delete
+        try:
+            with self.assertRaises(OSError):
+                old.func(*old.args)
+            self.assertIsNotNone(scheduler._scheduler.get_job(old.id))
+            self.assertIs(scheduler._tasks[task.id], task)
+        finally:
+            scheduler._scheduler.shutdown(wait=True)
+
     def test_removing_a_task_cancels_its_pending_snooze(self):
         scheduler = TaskScheduler(MagicMock())
         scheduler.start()
