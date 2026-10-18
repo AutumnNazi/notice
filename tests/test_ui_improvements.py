@@ -1109,6 +1109,69 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_queued_old_dispatch_does_not_fire_future_edited_reminder(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        finished = Event()
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_EXECUTED)
+        with scheduler._lock:
+            when = datetime.now() + timedelta(seconds=0.2)
+            old = Task(id="queued-edit", title="旧提醒", trigger_type="once",
+                       trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+            scheduler.upsert_task(old)
+            deadline = time.monotonic() + 3
+            while scheduler._scheduler.get_job(old.id) is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNone(scheduler._scheduler.get_job(old.id))
+            when = datetime.now() + timedelta(hours=1)
+            edited = Task(id=old.id, title="新提醒", trigger_type="once",
+                          trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+            scheduler.upsert_task(edited)
+            new_job = scheduler._scheduler.get_job(old.id)
+        self.assertTrue(finished.wait(3))
+        scheduler.notifier.send.assert_not_called()
+        self.assertTrue(edited.enabled)
+        self.assertIs(scheduler._scheduler.get_job(edited.id), new_job)
+
+    def test_failed_edit_restores_original_dispatch_identity(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        when = datetime.now() + timedelta(hours=1)
+        old = Task(id="identity-rollback", trigger_type="once",
+                   trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(old)
+        original = scheduler._scheduler.get_job(old.id)
+        edited = Task(id=old.id, trigger_type="interval", trigger_config={"minutes": 5})
+        with self.assertRaises(OSError):
+            with scheduler.task_transaction(old.id):
+                scheduler.upsert_task(edited, notify=False)
+                raise OSError("编辑保存失败")
+        restored = scheduler._scheduler.get_job(old.id)
+        self.assertIs(restored.args[1], old)
+        scheduler._remove_job(old.id)
+        original.func(*original.args)
+        scheduler.notifier.send.assert_called_once_with(old)
+        self.assertFalse(old.enabled)
+
+    def test_queued_old_dispatch_does_not_rearm_after_same_id_recreated(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        when = datetime.now() + timedelta(hours=1)
+        old = Task(id="recreated-id", trigger_type="once",
+                   trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(old)
+        original = scheduler._scheduler.get_job(old.id)
+        scheduler.remove_task(old.id)
+        replacement = Task(id=old.id, trigger_type="interval", trigger_config={"minutes": 5})
+        scheduler.upsert_task(replacement)
+        new_job = scheduler._scheduler.get_job(old.id)
+        original.func(*original.args)
+        scheduler.notifier.send.assert_not_called()
+        self.assertIs(scheduler._scheduler.get_job(old.id), new_job)
+
     def test_shutdown_does_not_switch_storage_mode_during_job_dispatch(self):
         from apscheduler.schedulers.base import STATE_STOPPED
 
@@ -1383,9 +1446,9 @@ class CoreRegressionTests(unittest.TestCase):
         original_run = scheduler._run_task
         calls = []
 
-        def delayed_worker(task_id):
+        def delayed_worker(task_id, expected=None):
             calls.append(task_id)
-            original_run(task_id)
+            original_run(task_id, expected)
             if len(calls) == 1:
                 deferred.set()
                 release.wait(3)
@@ -1675,7 +1738,14 @@ class CoreRegressionTests(unittest.TestCase):
                 self.assertTrue(ready.wait(3))
                 self.assertTrue(instance._send_direct())
                 # 再连上下一轮管道，证明上一条请求已被主监听读完，避免靠 sleep 猜处理时机。
-                self.assertTrue(instance.kernel32.WaitNamedPipeW(name, 3000))
+                deadline = time.monotonic() + 3
+                available = False
+                while time.monotonic() < deadline:
+                    if instance.kernel32.WaitNamedPipeW(name, 100):
+                        available = True
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(available)
                 instance.register_show_callback(callback)
                 callback.assert_called_once()
                 instance.register_show_callback(callback)

@@ -162,7 +162,7 @@ class TaskScheduler:
             if self._scheduler.get_job(job_id) is None:
                 self._scheduler.add_job(
                     self._fire_snooze if snooze else self._run_task,
-                    DateTrigger(run_date=datetime.now()), id=job_id, args=[task.id, request] if snooze else [task.id],
+                    DateTrigger(run_date=datetime.now()), id=job_id, args=[task.id, request] if snooze else [task.id, task],
                     # 恢复可能先于旧 worker 收尾，允许这次不发送的旧调用与补发调用短暂重叠。
                     replace_existing=True, misfire_grace_time=None, max_instances=2,
                 )
@@ -203,7 +203,7 @@ class TaskScheduler:
             self._run_task,
             trigger=trigger,
             id=task.id,
-            args=[task.id],
+            args=[task.id, task],
             replace_existing=True,
             coalesce=True,
             # 已排好的单次 job 在休眠/暂停恢复后仍需执行；周期任务只合并近期错过的触发。
@@ -260,10 +260,13 @@ class TaskScheduler:
                 if self._snooze_requests.get(task_id) is request:
                     self._snooze_requests.pop(task_id, None)
 
-    def _run_task(self, task_id: str) -> None:
+    def _run_task(self, task_id: str, expected: Task | None = None) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None or not task.enabled or self._stopping:
+                return
+            # 已排队的旧 job 不得按 ID 取走编辑后的新配置，提前发送并消耗新单次提醒。
+            if expected is not None and task is not expected:
                 return
             if self._paused:
                 if task.trigger_type in {"once", "weekly_last_workday"}:
@@ -288,7 +291,7 @@ class TaskScheduler:
                     # 单次 job 已被调度器取走；临时发送失败要重试，不能假装已提醒并停用。
                     self._scheduler.add_job(
                         self._run_task, DateTrigger(run_date=datetime.now() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)),
-                        id=task.id, args=[task.id], replace_existing=True, misfire_grace_time=None,
+                        id=task.id, args=[task.id, task], replace_existing=True, misfire_grace_time=None,
                     )
                     task.next_run = self.task_next_run(task.id)
             elif task.trigger_type == "weekly_last_workday" and task.enabled:
