@@ -93,7 +93,7 @@ class Task:
             self.enabled = False
             self.next_run = None
         if problems:
-            # 降级不得静默：原因交给 TaskStore 汇总输出到 stderr，便于窗口化运行后排查。
+            # 降级不得静默：原因交给 TaskStore 汇总写入运行日志，便于窗口化运行后排查。
             self.load_warning = "；".join(problems)
         return self
 

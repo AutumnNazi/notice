@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import io
 import os
 import sys
 import time
@@ -49,32 +48,37 @@ class TaskFileCorruptionTests(unittest.TestCase):
     """tasks.json 整体损坏（而非单条记录坏）时，启动要拿到空列表而不是抛异常。"""
 
     def load(self, raw: bytes) -> tuple[Path, list[Task], str]:
-        """在临时目录写一份损坏文件，跑一次真实加载，返回（文件路径, 提醒, stderr 文本）。"""
+        """在临时目录写一份损坏文件，跑一次真实加载，返回（文件路径, 提醒, 日志文本）。"""
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "tasks.json"
         path.write_bytes(raw)
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        with self.assertLogs("store", level="WARNING") as diagnostics:
             tasks = TaskStore(path).load_tasks()
-        return path, tasks, stderr.getvalue()
+        return path, tasks, "\n".join(diagnostics.output)
 
     def assert_quarantined(self, path: Path, raw: bytes, stderr: str, reason: str) -> None:
-        """损坏文件必须：原文一字不动、留一份备份、stderr 讲清坏的是哪个文件与为什么。"""
+        """损坏文件必须：原文一字不动、留一份备份、日志讲清坏的是哪个文件与为什么。"""
         self.assertEqual(path.read_bytes(), raw, "损坏的原文件不得改写，用户可能手工修复")
         backups = list(path.parent.glob(f"{path.name}.corrupt-*"))
         self.assertEqual(len(backups), 1, f"应留一份损坏备份，实际 {backups}")
         self.assertEqual(backups[0].read_bytes(), raw, "备份必须是损坏原文的副本")
-        self.assertIn(str(path), stderr, "stderr 必须指出损坏的文件路径")
-        self.assertIn(backups[0].name, stderr, "stderr 必须给出备份文件位置")
-        self.assertIn("默认", stderr, "stderr 必须说明已回退到安全值")
-        self.assertIn(reason, stderr, "stderr 必须说明具体原因")
+        self.assertIn(str(path), stderr, "日志必须指出损坏的文件路径")
+        self.assertIn(backups[0].name, stderr, "日志必须给出备份文件位置")
+        self.assertIn("默认", stderr, "日志必须说明已回退到安全值")
+        self.assertIn(reason, stderr, "日志必须说明具体原因")
 
     def test_invalid_json_returns_empty_list(self):
         raw = b'{"tasks": ['
         path, tasks, stderr = self.load(raw)
         self.assertEqual(tasks, [])
         self.assert_quarantined(path, raw, stderr, "JSON")
+
+    def test_invalid_utf8_returns_empty_list_and_preserves_original(self):
+        raw = b'{"tasks": [], "bad": "\xff"}'
+        path, tasks, diagnostics = self.load(raw)
+        self.assertEqual(tasks, [])
+        self.assert_quarantined(path, raw, diagnostics, "UTF-8")
 
     def test_non_object_top_level_returns_empty_list(self):
         raw = b'[{"id": "1"}]'
@@ -101,14 +105,13 @@ class TaskFileCorruptionTests(unittest.TestCase):
         path = Path(directory.name) / "tasks.json"
         raw = b'{"tasks": ['
         path.write_bytes(raw)
-        stderr = io.StringIO()
         with patch("store.shutil.copy2", side_effect=OSError("磁盘已满")), \
-             contextlib.redirect_stderr(stderr):
+             self.assertLogs("store", level="WARNING") as diagnostics:
             tasks = TaskStore(path).load_tasks()
         self.assertEqual(tasks, [])
         self.assertEqual(path.read_bytes(), raw)
         self.assertEqual(list(path.parent.glob("tasks.json.corrupt-*")), [])
-        self.assertIn("备份", stderr.getvalue())
+        self.assertIn("备份", "\n".join(diagnostics.output))
 
     def test_existing_identical_backup_is_not_duplicated(self):
         """同一份损坏内容只留一份备份：用户反复双击启动不该堆出一目录副本。"""
@@ -119,11 +122,10 @@ class TaskFileCorruptionTests(unittest.TestCase):
         path.write_bytes(raw)
         earlier = path.with_name("tasks.json.corrupt-20200101-000000")
         earlier.write_bytes(raw)
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        with self.assertLogs("store", level="WARNING") as diagnostics:
             self.assertEqual(TaskStore(path).load_tasks(), [])
         self.assertEqual(list(path.parent.glob("tasks.json.corrupt-*")), [earlier])
-        self.assertIn(earlier.name, stderr.getvalue())
+        self.assertIn(earlier.name, "\n".join(diagnostics.output))
 
     def test_later_save_replaces_corrupt_file_and_keeps_backup(self):
         """读损坏之后的一次正常保存会覆盖原文件，备份是用户找回旧内容的唯一依据。"""
@@ -141,6 +143,7 @@ class SettingsFileCorruptionTests(unittest.TestCase):
     def test_corrupt_settings_fall_back_to_defaults(self):
         cases = {
             "非法 JSON": b'{"font_family": ',
+            "非法 UTF-8": b'{"font_family": "\xff"}',
             "顶层是数组": b'["font_family"]',
             "顶层是字符串": b'"font_family"',
             "顶层是 null": b"null",
@@ -151,8 +154,7 @@ class SettingsFileCorruptionTests(unittest.TestCase):
                 self.addCleanup(directory.cleanup)
                 path = Path(directory.name) / "settings.json"
                 path.write_bytes(raw)
-                stderr = io.StringIO()
-                with contextlib.redirect_stderr(stderr):
+                with self.assertLogs("store", level="WARNING") as diagnostics:
                     settings = TaskStore(path).load_settings(path)
                 self.assertEqual(settings, SETTINGS_DEFAULTS)
                 self.assertIsNot(settings, SETTINGS_DEFAULTS, "必须返回副本，别让调用方改坏默认值")
@@ -160,7 +162,7 @@ class SettingsFileCorruptionTests(unittest.TestCase):
                 backups = list(path.parent.glob("settings.json.corrupt-*"))
                 self.assertEqual(len(backups), 1, f"应留一份损坏备份，实际 {backups}")
                 self.assertEqual(backups[0].read_bytes(), raw)
-                stderr_text = stderr.getvalue()
+                stderr_text = "\n".join(diagnostics.output)
                 self.assertIn(str(path), stderr_text)
                 self.assertIn(backups[0].name, stderr_text)
 

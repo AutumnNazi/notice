@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from threading import RLock
-from typing import Callable
+from typing import Callable, Iterator
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -11,8 +11,11 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from chinese_calendar import is_workday
 
+from core.app_logging import get_logger
 from core.models import Task
 from core.notifier import Notifier
+
+_LOGGER = get_logger(__name__)
 
 # 稍后提醒用的独立 job 前缀：补发的这一次通知不能占用提醒自己的调度槽位。
 SNOOZE_JOB_PREFIX = "snooze:"
@@ -48,23 +51,59 @@ class TaskScheduler:
                     # 只停用这一条并留痕，同批其它提醒照常注册，程序也照常打得开。
                     task.enabled = False
                     task.next_run = None
-                    print(f"[提醒调度] 提醒“{task.title}”的触发配置无法排程，已停用：{exc}", file=sys.stderr)
+                    _LOGGER.warning("[提醒调度] 提醒“%s”的触发配置无法排程，已停用：%s", task.title, exc)
             self._notify_changed()
 
-    def upsert_task(self, task: Task) -> None:
+    def upsert_task(self, task: Task, *, notify: bool = True) -> None:
         with self._lock:
             # 先验证并安装新 job，失败时不触碰原任务和原调度。
             self._schedule_task(task)
             self._tasks[task.id] = task
-            self._notify_changed()
+            if notify:
+                self._notify_changed()
 
-    def remove_task(self, task_id: str) -> None:
+    @contextmanager
+    def task_transaction(self, task_id: str) -> Iterator[None]:
+        # 持久化失败时恢复原 job，而不是重新计算周期；稍后提醒也要跟随删除回滚。
+        # 同时锁住 job store，避免回滚窗口内新 job 已被调度线程取走执行。
+        with self._lock, self._scheduler._jobstores_lock:
+            previous = self._tasks.get(task_id)
+            state = (previous.enabled, previous.next_run) if previous else None
+            jobs = {key: self._scheduler.get_job(key)
+                    for key in (task_id, self._snooze_job_id(task_id))}
+            try:
+                yield
+            except Exception:
+                if previous is None:
+                    self._tasks.pop(task_id, None)
+                else:
+                    self._tasks[task_id] = previous
+                    previous.enabled, previous.next_run = state
+                for key, job in jobs.items():
+                    current = self._scheduler.get_job(key)
+                    if current is job:
+                        continue
+                    if job is None:
+                        self._remove_job(key)
+                    else:
+                        self._scheduler.add_job(
+                            job.func, trigger=job.trigger, id=job.id, args=job.args,
+                            kwargs=job.kwargs, executor=job.executor,
+                            next_run_time=job.next_run_time, name=job.name,
+                            misfire_grace_time=job.misfire_grace_time,
+                            coalesce=job.coalesce, max_instances=job.max_instances,
+                            replace_existing=True,
+                        )
+                raise
+
+    def remove_task(self, task_id: str, *, notify: bool = True) -> None:
         with self._lock:
             self._tasks.pop(task_id, None)
             self._remove_job(task_id)
             # 连挂起的「稍后提醒」一起撤掉，否则删掉提醒后还会再弹一次。
             self._remove_job(self._snooze_job_id(task_id))
-            self._notify_changed()
+            if notify:
+                self._notify_changed()
 
     def pause_all(self) -> None:
         self._paused = True

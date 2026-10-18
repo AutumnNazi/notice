@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import contextlib
 import gc
 import io
 import json
+import logging
 import queue
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 import unittest
@@ -811,6 +812,162 @@ class SnoozeMenuTests(_MenuOpeningTests):
         self.assertIn("暂停", info.call_args[0][2])
 
 
+class TaskSaveRollbackTests(unittest.TestCase):
+    def setUp(self):
+        _reclaim_idle_tk_interpreters()
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "tasks.json"
+        self.app = app_module.NoticeApp.__new__(app_module.NoticeApp)
+        self.app.root = MagicMock()
+        self.app.tasks = []
+        self.app.selected_task_id = None
+        self.app._ui_ready = True
+        self.app._refresh_queue = queue.Queue()
+        self.app._refresh_ui = MagicMock()
+        self.app.store = TaskStore(self.path)
+        self.app.scheduler = TaskScheduler(MagicMock(), on_change=self.app._schedule_refresh)
+        self.app.scheduler.start()
+        self.addCleanup(self.app.scheduler._scheduler.shutdown, wait=True)
+
+    def test_failed_add_leaves_no_active_reminder(self):
+        self.app.store.save_tasks([])
+        before = self.path.read_bytes()
+        task = Task(id="save-add", trigger_type="interval", trigger_config={"hours": 1})
+        with patch.object(app_module, "TaskDialog", return_value=SimpleNamespace(result=task)), \
+             patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
+             patch.object(app_module, "show_error") as error:
+            self.app.add_task()
+        self.assertEqual(self.app.tasks, [])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertIsNone(self.app.scheduler.task_next_run(task.id), "保存失败不得留下幽灵调度")
+        self.assertNotIn(task.id, self.app.scheduler._tasks)
+        self.assertIsNone(self.app.selected_task_id)
+        error.assert_called_once()
+
+    def _existing_task(self) -> Task:
+        task = Task(id="save-existing", title="原提醒", trigger_type="interval", trigger_config={"hours": 1})
+        self.app._save_task_change(task)
+        self.app.scheduler.snooze_task(task.id)
+        return task
+
+    def test_failed_edit_keeps_old_content_and_exact_next_run(self):
+        task = self._existing_task()
+        before = self.path.read_bytes()
+        next_run = self.app.scheduler._scheduler.get_job(task.id).next_run_time
+        edited = Task(id=task.id, title="新提醒", trigger_type="interval", trigger_config={"minutes": 5})
+        with patch.object(app_module, "TaskDialog", return_value=SimpleNamespace(result=edited)), \
+             patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
+             patch.object(app_module, "show_error") as error:
+            self.app.edit_selected_task()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertIs(self.app.tasks[0], task)
+        self.assertIs(self.app.scheduler._tasks[task.id], task)
+        job = self.app.scheduler._scheduler.get_job(task.id)
+        self.assertEqual(job.next_run_time, next_run, "回滚不得重置固定间隔计时")
+        self.assertEqual(job.trigger.interval, timedelta(hours=1))
+        error.assert_called_once()
+
+    def test_failed_delete_restores_reminder_and_snooze(self):
+        task = self._existing_task()
+        before = self.path.read_bytes()
+        next_run = self.app.scheduler._scheduler.get_job(task.id).next_run_time
+        snooze_id = self.app.scheduler._snooze_job_id(task.id)
+        snooze_run = self.app.scheduler._scheduler.get_job(snooze_id).next_run_time
+        with patch.object(app_module, "ask_yes_no", return_value=True), \
+             patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
+             patch.object(app_module, "show_error") as error:
+            self.app.delete_selected_task()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.app.tasks, [task])
+        self.assertEqual(self.app.selected_task_id, task.id)
+        self.assertEqual(self.app.scheduler._scheduler.get_job(task.id).next_run_time, next_run)
+        self.assertEqual(self.app.scheduler._scheduler.get_job(snooze_id).next_run_time, snooze_run)
+        error.assert_called_once()
+
+    def test_failed_disable_keeps_enabled_state_and_job(self):
+        task = self._existing_task()
+        before = self.path.read_bytes()
+        next_run = self.app.scheduler._scheduler.get_job(task.id).next_run_time
+        with patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
+             patch.object(app_module, "show_error") as error:
+            self.app.toggle_selected_task()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertTrue(task.enabled)
+        self.assertIs(self.app.tasks[0], task)
+        self.assertEqual(self.app.scheduler._scheduler.get_job(task.id).next_run_time, next_run)
+        error.assert_called_once()
+
+    def test_successful_changes_keep_file_and_scheduler_in_sync(self):
+        task = self._existing_task()
+        self.app.toggle_selected_task()
+        self.assertFalse(self.app.store.load_tasks()[0].enabled)
+        self.assertIsNone(self.app.scheduler.task_next_run(task.id))
+        self.app.toggle_selected_task()
+        self.assertTrue(self.app.store.load_tasks()[0].enabled)
+        self.assertIsNotNone(self.app.scheduler.task_next_run(task.id))
+        with patch.object(app_module, "ask_yes_no", return_value=True):
+            self.app.delete_selected_task()
+        self.assertEqual(self.app.store.load_tasks(), [])
+        self.assertNotIn(task.id, self.app.scheduler._tasks)
+        self.assertEqual(self.app.scheduler._scheduler.get_jobs(), [])
+
+    def test_failed_schedule_keeps_old_file_and_job(self):
+        task = self._existing_task()
+        before = self.path.read_bytes()
+        job = self.app.scheduler._scheduler.get_job(task.id)
+        edited = Task(id=task.id, trigger_type="interval", trigger_config={"minutes": 5})
+        jobstore = self.app.scheduler._scheduler._lookup_jobstore("default")
+        with patch.object(jobstore, "update_job", side_effect=OSError("调度存储失败")):
+            with self.assertRaises(OSError):
+                self.app._save_task_change(edited)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertIs(self.app.tasks[0], task)
+        self.assertIs(self.app.scheduler._scheduler.get_job(task.id), job)
+
+    def test_new_job_cannot_fire_during_failed_disk_write(self):
+        when = datetime.now() + timedelta(seconds=1)
+        task = Task(id="save-race", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+
+        def fail_after_due(_descriptor):
+            self.assertIsNotNone(self.app.scheduler.task_next_run(task.id))
+            time.sleep(max(0, (when - datetime.now()).total_seconds()) + 0.2)
+            raise OSError("写盘失败")
+
+        with patch("store.os.fsync", side_effect=fail_after_due):
+            with self.assertRaises(OSError):
+                self.app._save_task_change(task)
+        time.sleep(0.1)
+        self.app.scheduler.notifier.send.assert_not_called()
+        self.assertEqual(self.app.tasks, [])
+        self.assertIsNone(self.app.scheduler.task_next_run(task.id))
+
+    def test_failed_enable_keeps_disabled_state_and_no_job(self):
+        task = Task(id="save-disabled", enabled=False, trigger_type="interval", trigger_config={"hours": 1})
+        self.app._save_task_change(task)
+        before = self.path.read_bytes()
+        with patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
+             patch.object(app_module, "show_error") as error:
+            self.app.toggle_selected_task()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse(self.app.tasks[0].enabled)
+        self.assertIs(self.app.scheduler._tasks[task.id], task)
+        self.assertIsNone(self.app.scheduler.task_next_run(task.id))
+        error.assert_called_once()
+
+    def test_refresh_error_is_not_misreported_as_failed_save(self):
+        task = Task(id="save-refresh", trigger_type="interval", trigger_config={"hours": 1})
+        self.app._refresh_ui.side_effect = RuntimeError("渲染失败")
+        with patch.object(app_module, "TaskDialog", return_value=SimpleNamespace(result=task)), \
+             patch.object(app_module, "show_error") as error:
+            with self.assertRaisesRegex(RuntimeError, "渲染失败"):
+                self.app.add_task()
+        self.assertEqual(self.app.store.load_tasks()[0].id, task.id)
+        self.assertIsNotNone(self.app.scheduler.task_next_run(task.id))
+        error.assert_not_called()
+
+
 class CoreRegressionTests(unittest.TestCase):
     def setUp(self):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
@@ -977,16 +1134,18 @@ class CoreRegressionTests(unittest.TestCase):
                     scheduler._scheduler.shutdown(wait=True)
 
     def _load_records(self, records: list[object]) -> tuple[list[Task], str, list[object]]:
-        """按启动时的真实路径读一份 tasks.json，并回放 stderr 中的降级报告。"""
+        """按启动时的真实路径读一份 tasks.json，并检查日志中的降级报告。"""
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "tasks.json"
         path.write_text(json.dumps({"tasks": records}, ensure_ascii=False), encoding="utf-8")
         saved = json.loads(path.read_text(encoding="utf-8"))["tasks"]
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        output = io.StringIO()
+        logger = logging.Logger("test-store")
+        logger.addHandler(logging.StreamHandler(output))
+        with patch("store._LOGGER", logger):
             tasks = TaskStore(path).load_tasks()
-        return tasks, stderr.getvalue(), saved
+        return tasks, output.getvalue(), saved
 
     def test_broken_interval_record_is_degraded_without_losing_healthy_ones(self):
         broken = {"id": "bad", "title": "坏间隔", "body": "", "trigger_type": "interval",
@@ -1007,7 +1166,7 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertTrue(intact.enabled)
         self.assertEqual(intact.trigger_config, {"weekdays": [0], "hour": 9})
         self.assertEqual(intact.title, "喝水")
-        # 降级不得静默：stderr 要能看出是哪一条、因为什么被降级。
+        # 降级不得静默：日志要能看出是哪一条、因为什么被降级。
         self.assertIn("bad", stderr)
         self.assertIn("循环间隔", stderr)
 

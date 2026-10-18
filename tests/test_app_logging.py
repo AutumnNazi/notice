@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
 import logging.handlers
 import re
@@ -10,12 +11,15 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
 from core import app_logging
+from core.models import Task
+from core.scheduler import TaskScheduler
+from store import TaskStore
 
 
 class AppLoggingTests(unittest.TestCase):
@@ -64,6 +68,37 @@ class AppLoggingTests(unittest.TestCase):
         self.assertEqual(handler.backupCount, 3)
         self.assertEqual(handler.encoding, "utf-8")
         self.assertEqual(Path(handler.baseFilename), self.log_dir / app_logging.LOG_FILE_NAME)
+
+    def test_corrupt_file_diagnostic_reaches_log_without_stderr(self):
+        path = Path(self._temp.name) / "tasks.json"
+        path.write_bytes(b'{"tasks": [')
+        app_logging.setup_logging(self.log_dir)
+        with patch.object(sys, "stderr", None):
+            self.assertEqual(TaskStore(path).load_tasks(), [])
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn(str(path), content)
+        self.assertIn("JSON", content)
+        self.assertIn("corrupt-", content)
+
+    def test_degraded_record_and_invalid_schedule_reach_log(self):
+        path = Path(self._temp.name) / "tasks.json"
+        path.write_text(json.dumps({"tasks": [{"id": "broken-interval", "trigger_type": "interval",
+                                               "trigger_config": {"minutes": -1}}]}), encoding="utf-8")
+        app_logging.setup_logging(self.log_dir)
+        with patch.object(sys, "stderr", None):
+            self.assertFalse(TaskStore(path).load_tasks()[0].enabled)
+            scheduler = TaskScheduler(MagicMock())
+            scheduler.start()
+            try:
+                scheduler.sync_tasks([Task(id="broken-weekly", title="坏星期配置", trigger_type="weekly",
+                                           trigger_config={"weekdays": [0], "hour": 25})])
+            finally:
+                scheduler._scheduler.shutdown(wait=True)
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn("broken-interval", content)
+        self.assertIn("循环间隔", content)
+        self.assertIn("坏星期配置", content)
+        self.assertIn("无法排程", content)
 
     def test_repeated_setup_keeps_one_handler_and_one_record(self):
         app_logging.setup_logging(self.log_dir)

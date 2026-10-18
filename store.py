@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sys
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from config import DATA_DIR, SETTINGS_DEFAULTS, SETTINGS_FILE, TASKS_FILE
+from core.app_logging import get_logger
 from core.models import Task
+
+
+_LOGGER = get_logger(__name__)
 
 
 class TaskStore:
@@ -35,7 +38,7 @@ class TaskStore:
             return []
         # 逐条读取：一条坏记录不能让整批提醒都读不出来，更不能让窗口化运行的程序启动即崩。
         # 坏记录由 Task.from_dict(strict=False) 降级成“已停用”，这里只负责汇总并把数量与
-        # 原因写到 stderr —— 窗口化运行时看不到 stderr，但必须留下可查的痕迹。
+        # 原因写入运行日志，窗口化运行时也能追查。
         tasks: list[Task] = []
         problems: list[str] = []
         for index, item in enumerate(records):
@@ -48,9 +51,9 @@ class TaskStore:
             if task.load_warning:
                 problems.append(f"第 {index + 1} 条（{task.id}）：{task.load_warning}")
         if problems:
-            print(f"[提醒数据] {len(problems)} 条记录读取异常，已降级为停用或跳过：", file=sys.stderr)
+            _LOGGER.warning("[提醒数据] %s 条记录读取异常，已降级为停用或跳过：", len(problems))
             for message in problems:
-                print(f"  - {message}", file=sys.stderr)
+                _LOGGER.warning("  - %s", message)
         return tasks
 
     def save_tasks(self, tasks: list[Task]) -> None:
@@ -71,18 +74,21 @@ class TaskStore:
     def _read_json(self, path: Path, label: str) -> dict | None:
         """读 JSON；文件级损坏时返回 None，由调用方回退到安全值。
 
-        窗口化打包后没有控制台，stderr 是唯一的排障线索，所以每次降级都要写清路径与原因，
+        窗口化打包后没有控制台，每次降级都要在运行日志中写清路径与原因，
         不做静默兜底。
         """
         try:
             with path.open("r", encoding="utf-8-sig") as handle:
                 data = json.load(handle)
+        except UnicodeDecodeError as error:
+            self._quarantine(path, label, f"UTF-8 解码失败：{error}")
+            return None
         except json.JSONDecodeError as error:
             self._quarantine(path, label, f"JSON 解析失败：{error}")
             return None
         except OSError as error:
             # 文件被占用或权限不足时连备份都读不出来，这里只提示、不改动也无法改动原文件。
-            print(f"[{label}] 读取 {path} 失败，本次已改用安全默认值：{error}", file=sys.stderr)
+            _LOGGER.warning("[%s] 读取 %s 失败，本次已改用安全默认值：%s", label, path, error)
             return None
         if not isinstance(data, dict):
             self._quarantine(path, label, f"顶层应为 JSON 对象，实际是 {type(data).__name__}")
@@ -96,8 +102,8 @@ class TaskStore:
         重复复制，免得用户反复双击启动时堆出一目录备份。备份自身失败（磁盘满、权限不足）
         也不能把启动拖崩，此时只报告并继续用安全值。
         """
-        print(f"[{label}] {path} 内容损坏，本次已改用安全默认值", file=sys.stderr)
-        print(f"  - 原因：{reason}", file=sys.stderr)
+        _LOGGER.warning("[%s] %s 内容损坏，本次已改用安全默认值", label, path)
+        _LOGGER.warning("  - 原因：%s", reason)
         backup = None
         try:
             broken = path.read_bytes()
@@ -116,9 +122,9 @@ class TaskStore:
             try:
                 shutil.copy2(path, backup)
             except OSError as error:
-                print(f"  - 备份失败（{backup}）：{error}，原文件保持原样", file=sys.stderr)
+                _LOGGER.warning("  - 备份失败（%s）：%s，原文件保持原样", backup, error)
                 return
-        print(f"  - 原文件未改动，已留档副本：{backup}", file=sys.stderr)
+        _LOGGER.warning("  - 原文件未改动，已留档副本：%s", backup)
 
     def _save_json(self, path: Path, payload: dict) -> None:
         # 完整写入并落盘后才替换原文件；失败时旧提醒和设置仍然可读。

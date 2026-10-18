@@ -11,6 +11,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import winreg
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import ttk
@@ -1623,12 +1624,34 @@ class NoticeApp:
         self.root.wait_window(dialog)
         if dialog.result:
             try:
-                self.tasks.append(dialog.result)
-                self.selected_task_id = dialog.result.id
-                self.scheduler.upsert_task(dialog.result)
+                self._save_task_change(dialog.result)
             except Exception as exc:
-                self.tasks = [task for task in self.tasks if task.id != dialog.result.id]
                 show_error(self.root, "添加提醒", f"保存失败：{exc}")
+            else:
+                self._refresh_ui()
+
+    def _save_task_change(self, task: Task, *, delete: bool = False) -> None:
+        previous_tasks = self.tasks[:]
+        previous_selection = self.selected_task_id
+        try:
+            with self.scheduler.task_transaction(task.id):
+                if delete:
+                    self.tasks = [item for item in self.tasks if item.id != task.id]
+                    self.selected_task_id = self.tasks[0].id if self.tasks else None
+                    self.scheduler.remove_task(task.id, notify=False)
+                else:
+                    index = next((i for i, item in enumerate(self.tasks) if item.id == task.id), None)
+                    if index is None:
+                        self.tasks.append(task)
+                    else:
+                        self.tasks[index] = task
+                    self.selected_task_id = task.id
+                    self.scheduler.upsert_task(task, notify=False)
+                self._persist_tasks()
+        except Exception:
+            self.tasks = previous_tasks
+            self.selected_task_id = previous_selection
+            raise
 
     def edit_selected_task(self) -> None:
         task = self._selected_task()
@@ -1637,14 +1660,12 @@ class NoticeApp:
         dialog = TaskDialog(self.root, task=task)
         self.root.wait_window(dialog)
         if dialog.result:
-            index = self.tasks.index(task)
             try:
-                self.tasks[index] = dialog.result
-                self.selected_task_id = dialog.result.id
-                self.scheduler.upsert_task(dialog.result)
+                self._save_task_change(dialog.result)
             except Exception as exc:
-                self.tasks[index] = task
                 show_error(self.root, "编辑提醒", f"保存失败：{exc}")
+            else:
+                self._refresh_ui()
 
     def snooze_selected_task(self) -> None:
         # 这条提醒现在处理不了时，补一次通知就够，不动它本身的周期设置。
@@ -1672,22 +1693,24 @@ class NoticeApp:
             return
         if not ask_yes_no(self.root, "删除提醒", f"确认删除“{task.title}”吗？"):
             return
-        self.tasks = [item for item in self.tasks if item.id != task.id]
-        self.selected_task_id = self.tasks[0].id if self.tasks else None
-        self.scheduler.remove_task(task.id)
+        try:
+            self._save_task_change(task, delete=True)
+        except Exception as exc:
+            show_error(self.root, "删除提醒", f"删除失败：{exc}")
+        else:
+            self._refresh_ui()
 
     def toggle_selected_task(self) -> None:
         task = self._selected_task()
         if not task:
             return
-        previous = task.enabled
         try:
-            task.enabled = not task.enabled
-            self.scheduler.upsert_task(task)
-            self._refresh_ui()
+            updated = replace(task, enabled=not task.enabled)
+            self._save_task_change(updated)
         except Exception as exc:
-            task.enabled = previous
             show_error(self.root, "更新提醒", f"状态切换失败：{exc}")
+        else:
+            self._refresh_ui()
 
     def toggle_pause_all(self) -> None:
         if self.scheduler.paused:
