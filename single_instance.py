@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.app_logging import get_logger
+from wake import _send_to_pipe
 
 _LOGGER = get_logger(__name__)
 
@@ -101,18 +102,9 @@ def _listener_thread() -> None:
             kernel32.CloseHandle(pipe)
 
 
-def _send_direct() -> bool:
+def _send_direct(*, timeout: float = 3.0) -> bool:
     """直接连接管道发送唤醒（回退方案）。"""
-    if not kernel32.WaitNamedPipeW(PIPE_NAME, 3000):
-        return False
-    h = kernel32.CreateFileW(PIPE_NAME, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
-    if h == INVALID_HANDLE:
-        return False
-    try:
-        written = ctypes.wintypes.DWORD()
-        return bool(kernel32.WriteFile(h, b"WAKE", 4, ctypes.byref(written), None)) and written.value == 4
-    finally:
-        kernel32.CloseHandle(h)
+    return _send_to_pipe(b"WAKE", pipe_name=PIPE_NAME, timeout=timeout)
 
 
 # ── wake helper 管理 ─────────────────────────────────────────────────
@@ -171,5 +163,5 @@ def register_show_callback(callback: Callable[[], None]) -> None:
 
 def stop_helper() -> None:
     _listener_stop.set()
-    _send_direct()
+    _send_direct(timeout=0.1)
     # 互斥句柄留到进程退出由 Windows 释放，避免退出清理期间第二实例抢先启动。

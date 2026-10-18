@@ -1839,7 +1839,7 @@ class CoreRegressionTests(unittest.TestCase):
             kernel.WaitNamedPipeW.return_value = True
             kernel.CreateFileW.return_value = 123
             kernel.WriteFile.return_value = False
-            with self.subTest(module=module.__name__), patch.object(module, "kernel32", kernel):
+            with self.subTest(module=module.__name__), patch.object(wake, "kernel32", kernel):
                 if module is instance:
                     with patch.object(instance, "_listener_ready"):
                         self.assertFalse(operation())
@@ -1870,6 +1870,74 @@ class CoreRegressionTests(unittest.TestCase):
                     instance._send_direct()
                     thread.join(0.05)
                 self.assertFalse(thread.is_alive(), "测试监听线程必须退出")
+
+    def test_wake_senders_wait_for_delayed_pipe_creation(self):
+        import single_instance as instance
+        import wake
+        from uuid import uuid4
+
+        for sender in ("direct", "helper"):
+            with self.subTest(sender=sender):
+                name = rf"\\.\pipe\NoticeDelayedTest_{uuid4().hex}"
+                ready, stop, received = Event(), Event(), Event()
+
+                def delayed_listener():
+                    time.sleep(0.1)
+                    instance._listener_thread()
+
+                with patch.object(instance, "PIPE_NAME", name), patch.object(wake, "PIPE_NAME", name), \
+                     patch.object(instance, "_listener_ready", ready), patch.object(instance, "_listener_stop", stop), \
+                     patch.object(instance, "_SHOW_CALLBACK", received.set):
+                    thread = threading.Thread(target=delayed_listener, daemon=True)
+                    thread.start()
+                    try:
+                        sent = instance._send_direct() if sender == "direct" else wake._send_to_pipe(b"WAKE")
+                        self.assertTrue(sent, "发送端不能在监听尚未创建时立即放弃")
+                        self.assertTrue(received.wait(3))
+                    finally:
+                        stop.set()
+                        deadline = time.monotonic() + 3
+                        while thread.is_alive() and time.monotonic() < deadline:
+                            instance._send_direct()
+                            thread.join(0.05)
+                        self.assertFalse(thread.is_alive())
+
+    def test_missing_pipe_timeout_is_bounded_and_permission_failure_is_not_retried(self):
+        import wake
+        from uuid import uuid4
+
+        start = time.monotonic()
+        self.assertFalse(wake._send_to_pipe(b"WAKE", pipe_name=rf"\\.\pipe\NoticeAbsent_{uuid4().hex}", timeout=0.06))
+        elapsed = time.monotonic() - start
+        self.assertGreaterEqual(elapsed, 0.05)
+        self.assertLess(elapsed, 1.0)
+        kernel = MagicMock()
+        kernel.WaitNamedPipeW.return_value = False
+        kernel.GetLastError.return_value = 5
+        with patch.object(wake, "kernel32", kernel), patch.object(wake.time, "sleep") as sleep:
+            self.assertFalse(wake._send_to_pipe(b"WAKE"))
+        kernel.WaitNamedPipeW.assert_called_once()
+        sleep.assert_not_called()
+        kernel.WriteFile.assert_not_called()
+
+    def test_pipe_connection_race_retries_before_write_but_write_is_not_repeated(self):
+        import wake
+
+        kernel = MagicMock()
+        kernel.WaitNamedPipeW.return_value = True
+        kernel.CreateFileW.side_effect = [wake.INVALID_HANDLE, 123]
+        kernel.GetLastError.return_value = 231
+
+        def write(_handle, _data, size, written, _overlapped):
+            written._obj.value = size
+            return True
+
+        kernel.WriteFile.side_effect = write
+        with patch.object(wake, "kernel32", kernel):
+            self.assertTrue(wake._send_to_pipe(b"WAKE"))
+        self.assertEqual(kernel.CreateFileW.call_count, 2)
+        kernel.WriteFile.assert_called_once()
+        kernel.CloseHandle.assert_called_once_with(123)
 
     def test_startup_wake_is_delivered_once_after_callback_registration(self):
         import single_instance as instance
