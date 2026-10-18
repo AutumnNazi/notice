@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from threading import Lock
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 import pythoncom
@@ -17,6 +18,7 @@ from core.app_logging import get_logger
 from core.models import Task, validate_notification_text
 
 _LOGGER = get_logger(__name__)
+_SHORTCUT_LOCK = Lock()
 POWERSHELL = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
 NOTIFICATION_TIMEOUT_SECONDS = 15
 
@@ -70,34 +72,39 @@ $notifier.Show($toast);
             pythoncom.CoUninitialize()
 
     def _ensure_start_menu_shortcut(self) -> None:
-        START_MENU_DIR.mkdir(parents=True, exist_ok=True)
-        self._create_shortcut()
+        with _SHORTCUT_LOCK:
+            START_MENU_DIR.mkdir(parents=True, exist_ok=True)
+            self._create_shortcut()
 
-        try:
-            store = propsys.SHGetPropertyStoreFromParsingName(str(SHORTCUT_FILE), None, 2, propsys.IID_IPropertyStore)
-            current_value = store.GetValue(pscon.PKEY_AppUserModel_ID).GetValue()
-            if current_value != APP_ID:
+            try:
+                store = propsys.SHGetPropertyStoreFromParsingName(str(SHORTCUT_FILE), None, 2, propsys.IID_IPropertyStore)
+                current_value = store.GetValue(pscon.PKEY_AppUserModel_ID).GetValue()
+                if current_value != APP_ID:
+                    store.SetValue(pscon.PKEY_AppUserModel_ID, propsys.PROPVARIANTType(APP_ID))
+                    store.Commit()
+            except Exception:
+                # Recreate once if shortcut metadata is broken.
+                self._create_shortcut(force=True)
+                store = propsys.SHGetPropertyStoreFromParsingName(str(SHORTCUT_FILE), None, 2, propsys.IID_IPropertyStore)
                 store.SetValue(pscon.PKEY_AppUserModel_ID, propsys.PROPVARIANTType(APP_ID))
                 store.Commit()
-        except Exception:
-            # Recreate once if shortcut metadata is broken.
-            self._create_shortcut()
-            store = propsys.SHGetPropertyStoreFromParsingName(str(SHORTCUT_FILE), None, 2, propsys.IID_IPropertyStore)
-            store.SetValue(pscon.PKEY_AppUserModel_ID, propsys.PROPVARIANTType(APP_ID))
-            store.Commit()
 
-    def _create_shortcut(self) -> None:
+    def _create_shortcut(self, *, force: bool = False) -> None:
         shell = Dispatch("WScript.Shell")
         shortcut = shell.CreateShortcut(str(SHORTCUT_FILE))
         target, arguments, working_dir = self._launch_command()
-        shortcut.TargetPath = target
-        shortcut.Arguments = arguments
-        shortcut.WorkingDirectory = working_dir
-        shortcut.Description = APP_NAME
+        properties = {"TargetPath": target, "Arguments": arguments, "WorkingDirectory": working_dir,
+                      "Description": APP_NAME}
         icon = self._notification_icon()
         if icon:
-            shortcut.IconLocation = f"{icon},0"
-        shortcut.Save()
+            properties["IconLocation"] = f"{icon},0"
+        changed = force or not SHORTCUT_FILE.exists()
+        for name, value in properties.items():
+            if getattr(shortcut, name) != value:
+                setattr(shortcut, name, value)
+                changed = True
+        if changed:
+            shortcut.Save()
 
     def _launch_command(self) -> tuple[str, str, str]:
         if getattr(sys, "frozen", False):

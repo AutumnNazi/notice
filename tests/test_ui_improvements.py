@@ -1170,6 +1170,99 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_unchanged_notification_shortcut_is_not_rewritten(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            shortcut = root / "notice.lnk"
+            notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+            notifier_module.pythoncom.CoInitialize()
+            try:
+                with patch.object(notifier_module, "START_MENU_DIR", root), \
+                     patch.object(notifier_module, "SHORTCUT_FILE", shortcut), \
+                     patch.object(notifier, "_notification_icon", return_value=""):
+                    notifier._ensure_start_menu_shortcut()
+                    before = (shortcut.read_bytes(), shortcut.stat().st_mtime_ns)
+                    time.sleep(0.03)
+                    notifier._ensure_start_menu_shortcut()
+                    self.assertEqual((shortcut.read_bytes(), shortcut.stat().st_mtime_ns), before)
+            finally:
+                notifier_module.pythoncom.CoUninitialize()
+
+    def test_shortcut_repairs_changed_arguments_metadata_and_missing_file(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "notice.lnk"
+            notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+            notifier_module.pythoncom.CoInitialize()
+            try:
+                with patch.object(notifier_module, "START_MENU_DIR", root), \
+                     patch.object(notifier_module, "SHORTCUT_FILE", path), \
+                     patch.object(notifier, "_notification_icon", return_value=""):
+                    target, _, cwd = notifier._launch_command()
+                    with patch.object(notifier, "_launch_command", return_value=(target, "first", cwd)):
+                        notifier._ensure_start_menu_shortcut()
+                    with patch.object(notifier, "_launch_command", return_value=(target, "second", cwd)):
+                        notifier._ensure_start_menu_shortcut()
+                        shell = notifier_module.Dispatch("WScript.Shell")
+                        self.assertEqual(shell.CreateShortcut(str(path)).Arguments, "second")
+                        store = notifier_module.propsys.SHGetPropertyStoreFromParsingName(
+                            str(path), None, 2, notifier_module.propsys.IID_IPropertyStore)
+                        store.SetValue(notifier_module.pscon.PKEY_AppUserModel_ID,
+                                       notifier_module.propsys.PROPVARIANTType("Wrong.App.Id"))
+                        store.Commit()
+                        del store
+                        notifier._ensure_start_menu_shortcut()
+                        store = notifier_module.propsys.SHGetPropertyStoreFromParsingName(
+                            str(path), None, 2, notifier_module.propsys.IID_IPropertyStore)
+                        self.assertEqual(store.GetValue(notifier_module.pscon.PKEY_AppUserModel_ID).GetValue(),
+                                         notifier_module.APP_ID)
+                        del store
+                        path.unlink()
+                        notifier._ensure_start_menu_shortcut()
+                        self.assertTrue(path.is_file())
+                        self.assertEqual(shell.CreateShortcut(str(path)).Arguments, "second")
+            finally:
+                notifier_module.pythoncom.CoUninitialize()
+
+    def test_concurrent_shortcut_checks_do_not_overlap_writes(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+            active = 0
+            overlaps = []
+            barrier = threading.Barrier(3)
+            errors = []
+
+            def create(**_kwargs):
+                nonlocal active
+                active += 1
+                if active > 1:
+                    overlaps.append(active)
+                time.sleep(0.02)
+                active -= 1
+
+            def check():
+                try:
+                    barrier.wait(3)
+                    notifier._ensure_start_menu_shortcut()
+                except Exception as exc:
+                    errors.append(exc)
+
+            store = MagicMock()
+            store.GetValue.return_value.GetValue.return_value = notifier_module.APP_ID
+            with patch.object(notifier_module, "START_MENU_DIR", root), \
+                 patch.object(notifier_module, "SHORTCUT_FILE", root / "notice.lnk"), \
+                 patch.object(notifier, "_create_shortcut", side_effect=create), \
+                 patch.object(notifier_module.propsys, "SHGetPropertyStoreFromParsingName", return_value=store):
+                workers = [threading.Thread(target=check) for _ in range(3)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(3)
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertEqual(overlaps, [])
+
     def test_failed_pause_or_resume_keeps_flags_aligned_with_scheduler(self):
         from apscheduler.schedulers.base import STATE_PAUSED
 
