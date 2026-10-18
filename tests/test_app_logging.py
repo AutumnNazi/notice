@@ -7,6 +7,7 @@ import logging
 import logging.handlers
 import re
 import sys
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -142,6 +143,8 @@ class AppLoggingTests(unittest.TestCase):
 
     def test_uncaught_exception_is_logged_once_and_chained(self):
         calls = []
+        self.addCleanup(setattr, app_logging, "_original_thread_excepthook", getattr(app_logging, "_original_thread_excepthook", None))
+        self.addCleanup(setattr, threading, "excepthook", threading.excepthook)
         self.addCleanup(setattr, app_logging, "_original_excepthook", None)
         self.addCleanup(setattr, sys, "excepthook", sys.excepthook)
         app_logging._original_excepthook = None  # 重置包装状态，保证用例可重复执行
@@ -162,6 +165,42 @@ class AppLoggingTests(unittest.TestCase):
         self.assertIn("启动阶段崩溃", captured.output[0])
         self.assertEqual(len(calls), 1, "原有 excepthook 必须仍被调用")
         self.assertIs(calls[0][0], ValueError)
+
+    def test_uncaught_thread_exception_is_logged_once_and_chained(self):
+        calls = []
+        self.addCleanup(setattr, app_logging, "_original_excepthook", app_logging._original_excepthook)
+        self.addCleanup(setattr, app_logging, "_original_thread_excepthook", getattr(app_logging, "_original_thread_excepthook", None))
+        self.addCleanup(setattr, sys, "excepthook", sys.excepthook)
+        self.addCleanup(setattr, threading, "excepthook", threading.excepthook)
+        app_logging._original_excepthook = None
+        app_logging._original_thread_excepthook = None
+        threading.excepthook = lambda args: calls.append(args.exc_type)
+        app_logging.setup_logging(self.log_dir)
+        app_logging.install_excepthook()
+        wrapper = threading.excepthook
+        app_logging.install_excepthook()
+        self.assertIs(threading.excepthook, wrapper)
+
+        def fail():
+            raise RuntimeError("后台线程崩溃")
+
+        thread = threading.Thread(target=fail, name="notice-test-worker")
+        thread.start()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertEqual(content.count("后台线程异常"), 1)
+        self.assertIn("notice-test-worker", content)
+        self.assertIn("后台线程崩溃", content)
+        self.assertEqual(calls, [RuntimeError])
+
+        thread = threading.Thread(target=lambda: sys.exit(0), name="normal-exit-worker")
+        thread.start()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertNotIn("normal-exit-worker", content)
+        self.assertEqual(calls, [RuntimeError, SystemExit])
 
 
 if __name__ == "__main__":

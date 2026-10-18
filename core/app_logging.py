@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ FALLBACK_HANDLER_NAME = "notice-stderr"
 
 _installed_log_dir: Path | None = None
 _original_excepthook: Any = None
+_original_thread_excepthook: Any = None
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -98,14 +100,28 @@ def install_excepthook() -> None:
     --windowed 打包后 stderr 不可见，单实例校验、Tk 初始化等启动阶段的崩溃
     不会留下任何痕迹，只能靠这条记录事后定位。
     """
-    global _original_excepthook
-    if _original_excepthook is not None:
+    global _original_excepthook, _original_thread_excepthook
+    if _original_excepthook is None:
+        _original_excepthook = sys.excepthook
+
+        def _log_uncaught(exc_type, exc_value, exc_tb) -> None:
+            logging.getLogger(UNCAUGHT_LOGGER_NAME).critical(
+                "未捕获异常导致退出", exc_info=(exc_type, exc_value, exc_tb))
+            _original_excepthook(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = _log_uncaught
+
+    if _original_thread_excepthook is not None:
         return
-    _original_excepthook = sys.excepthook
+    _original_thread_excepthook = threading.excepthook
 
-    def _log_uncaught(exc_type, exc_value, exc_tb) -> None:
-        logging.getLogger(UNCAUGHT_LOGGER_NAME).critical(
-            "未捕获异常导致退出", exc_info=(exc_type, exc_value, exc_tb))
-        _original_excepthook(exc_type, exc_value, exc_tb)
+    def _log_thread_uncaught(args) -> None:
+        # threading 不会把未捕获异常交给 sys.excepthook；正常 SystemExit 不作为崩溃记录。
+        if args.exc_type is not SystemExit:
+            logging.getLogger(UNCAUGHT_LOGGER_NAME).error(
+                "后台线程异常：%s", args.thread.name if args.thread else "unknown",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+        _original_thread_excepthook(args)
 
-    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_thread_uncaught
