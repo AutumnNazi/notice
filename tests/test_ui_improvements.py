@@ -1170,6 +1170,65 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_failed_pause_or_resume_keeps_flags_aligned_with_scheduler(self):
+        from apscheduler.schedulers.base import STATE_PAUSED
+
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        task = Task(id="pause-error-state", trigger_type="interval", trigger_config={"hours": 1})
+        scheduler.upsert_task(task)
+        next_run = task.next_run
+        for operation in ("pause", "resume"):
+            if operation == "resume":
+                scheduler.pause_all()
+            previous = scheduler.paused
+            with self.subTest(operation=operation), \
+                 patch.object(scheduler._scheduler, operation, side_effect=RuntimeError("状态切换失败")):
+                with self.assertRaises(RuntimeError):
+                    scheduler.pause_all() if operation == "pause" else scheduler.resume_all()
+            self.assertEqual(scheduler.paused, previous)
+            self.assertEqual(scheduler.paused, scheduler._scheduler.state == STATE_PAUSED)
+            self.assertEqual(task.next_run, None if previous else next_run)
+
+    def test_pause_or_resume_error_after_transition_keeps_actual_state(self):
+        from apscheduler.schedulers.base import STATE_PAUSED
+
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        task = Task(id="post-transition-error", trigger_type="interval", trigger_config={"hours": 1})
+        scheduler.upsert_task(task)
+        for operation in ("pause", "resume"):
+            original = getattr(scheduler._scheduler, operation)
+
+            def transition_then_fail():
+                original()
+                raise RuntimeError("状态改变后的回调失败")
+
+            with self.subTest(operation=operation), patch.object(scheduler._scheduler, operation, transition_then_fail):
+                with self.assertRaises(RuntimeError):
+                    scheduler.pause_all() if operation == "pause" else scheduler.resume_all()
+            self.assertEqual(scheduler.paused, scheduler._scheduler.state == STATE_PAUSED)
+            self.assertEqual(task.next_run, None if scheduler.paused else scheduler.task_next_run(task.id))
+
+    def test_ui_pause_failure_refreshes_actual_state_and_reports_error(self):
+        for paused in (True, False):
+            with self.subTest(paused=paused):
+                app = app_module.NoticeApp.__new__(app_module.NoticeApp)
+                app.root = MagicMock()
+                app.scheduler = MagicMock()
+                app.scheduler.paused = paused
+                operation = app.scheduler.resume_all if paused else app.scheduler.pause_all
+                operation.side_effect = RuntimeError("状态切换失败")
+                app._refresh_ui = MagicMock()
+                with patch.object(app_module, "show_error") as error, self.assertLogs("gui.app", level="ERROR"):
+                    app.toggle_pause_all()
+                operation.assert_called_once()
+                app._refresh_ui.assert_called_once()
+                error.assert_called_once()
+                self.assertIn("状态切换失败", error.call_args.args[2])
+
     def test_notification_script_rejects_system_blocks_before_show(self):
         import base64
 

@@ -1738,10 +1738,16 @@ class NoticeApp:
             self._refresh_ui()
 
     def toggle_pause_all(self) -> None:
-        if self.scheduler.paused:
-            self.scheduler.resume_all()
-        else:
-            self.scheduler.pause_all()
+        try:
+            if self.scheduler.paused:
+                self.scheduler.resume_all()
+            else:
+                self.scheduler.pause_all()
+        except Exception as exc:
+            logging.getLogger(__name__).error("暂停或恢复提醒失败：%s", exc, exc_info=True)
+            self._refresh_ui()
+            show_error(self.root, "提醒状态切换失败", f"请查看当前状态并重试：{exc}")
+            return
         self._refresh_ui()
 
     def toggle_pause_all_from_tray(self) -> None:

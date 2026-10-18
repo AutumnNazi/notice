@@ -6,6 +6,7 @@ from threading import RLock
 from typing import Callable, Iterator
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.base import STATE_PAUSED
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -141,16 +142,21 @@ class TaskScheduler:
 
     def pause_all(self) -> None:
         with self._lock:
-            self._paused = True
-            self._scheduler.pause()
-            self._refresh_next_runs()
+            try:
+                self._scheduler.pause()
+            finally:
+                # API 或后续回调失败时也按真实调度状态同步，不预先宣布暂停成功。
+                self._paused = self._scheduler.state == STATE_PAUSED
+                self._refresh_next_runs()
             self._notify_changed()
 
     def resume_all(self) -> None:
         with self._lock:
-            self._paused = False
-            self._scheduler.resume()
-            self._refresh_next_runs()
+            try:
+                self._scheduler.resume()
+            finally:
+                self._paused = self._scheduler.state == STATE_PAUSED
+                self._refresh_next_runs()
             self._notify_changed()
 
     def _defer_paused_job(self, task: Task, *, snooze: bool = False, request: object | None = None) -> None:
