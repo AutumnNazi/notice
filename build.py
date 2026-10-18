@@ -56,6 +56,7 @@ def _wait_until_unlocked(paths: Iterable[Path], *, timeout: float = LOCK_TIMEOUT
     判据是真占用而不是「产物文件是否存在」：产物本来就在，拿存在与否判断会让每次打包都白等
     满超时。未被占用的产物不会触发任何等待。
     """
+    paths = tuple(paths)
     deadline = time.monotonic() + timeout
     while True:
         locked = [path for path in paths if _is_locked(path)]
@@ -176,9 +177,6 @@ def copy_data():
     if src_data.exists():
         _merge_data_tree(src_data, dst_data, overwrite=False)
 
-    if PRESERVED_DATA.exists():
-        shutil.rmtree(PRESERVED_DATA)
-
 
 def _merge_data_tree(src: Path, dst: Path, *, overwrite: bool) -> None:
     for item in src.iterdir():
@@ -197,7 +195,10 @@ def verify():
     print(f"\n[5/5] 检查产物...")
     if not MAIN_EXE.exists():
         print("[失败] 主程序未生成")
-        return
+        return False
+    if not WAKE_EXE.exists() or not (DIR_OUT / "data").is_dir():
+        print("[失败] 唤醒助手或数据目录缺失")
+        return False
     total_size = sum(f.stat().st_size for f in DIR_OUT.rglob("*") if f.is_file())
     print(f"[完成] {DIR_OUT}")
     print(f"       主程序: {MAIN_EXE.name}  ({MAIN_EXE.stat().st_size / 1024 / 1024:.1f} MB)")
@@ -207,19 +208,33 @@ def verify():
     data_dir = DIR_OUT / "data"
     if data_dir.exists():
         print(f"       数据目录: data/  (已包含)")
+    return True
 
 
 def main():
-    kill_old()
-    clean()
-    rc1 = build_main()
-    rc2 = build_wake()
-    copy_data()
-    verify()
-    if rc1 != 0 or rc2 != 0:
-        print("\n[警告] 部分步骤失败，请检查上方日志。")
-    input("\n按回车键关闭...")
+    try:
+        kill_old()
+        clean()
+        if build_main() != 0:
+            print("\n[失败] 主程序打包失败，停止后续步骤，保留用户数据备份。")
+            return 1
+        if build_wake() != 0:
+            print("\n[失败] 唤醒助手打包失败，停止后续步骤，保留用户数据备份。")
+            return 1
+        copy_data()
+        if not verify():
+            print("\n[失败] 产物不完整，请检查上方日志。")
+            return 1
+        if PRESERVED_DATA.exists():
+            shutil.rmtree(PRESERVED_DATA)
+        return 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"\n[失败] 打包中断：{exc}，用户数据备份保持不变。")
+        return 1
+    finally:
+        if sys.stdin is not None and sys.stdin.isatty():
+            input("\n按回车键关闭...")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

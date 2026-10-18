@@ -337,6 +337,72 @@ class BuildLockProbeTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             self.assertFalse(build._is_locked(Path(directory) / "没有这个文件.exe"))
 
+    def test_single_use_path_iterator_is_checked_on_every_poll(self):
+        path = Path("test-only.exe")
+        with patch("build._is_locked", return_value=True) as locked, \
+             patch("build.time.monotonic", side_effect=[0, 0, 7]), patch("build.time.sleep"):
+            self.assertEqual(build._wait_until_unlocked(iter([path]), timeout=6), [path])
+        self.assertEqual(locked.call_count, 2)
+
+    def test_failed_main_build_stops_before_wake_and_data_copy(self):
+        with patch("build.kill_old"), patch("build.clean"), patch("build.build_main", return_value=1), \
+             patch("build.build_wake") as wake, patch("build.copy_data") as copy, \
+             patch("build.verify") as verify, patch("builtins.input", return_value=""):
+            self.assertEqual(build.main(), 1)
+        wake.assert_not_called()
+        copy.assert_not_called()
+        verify.assert_not_called()
+
+    def test_failed_wake_build_stops_before_data_copy(self):
+        with patch("build.kill_old"), patch("build.clean"), patch("build.build_main", return_value=0), \
+             patch("build.build_wake", return_value=2), patch("build.copy_data") as copy, \
+             patch("build.verify") as verify, patch("builtins.input", return_value=""):
+            self.assertEqual(build.main(), 1)
+        copy.assert_not_called()
+        verify.assert_not_called()
+
+    def test_complete_build_releases_backup_only_after_verification(self):
+        with TemporaryDirectory() as directory:
+            backup = Path(directory) / "preserved"
+            backup.mkdir()
+            (backup / "tasks.json").write_bytes(b"original user data")
+            with patch("build.PRESERVED_DATA", backup), patch("build.kill_old"), patch("build.clean"), \
+                 patch("build.build_main", return_value=0), patch("build.build_wake", return_value=0), \
+                 patch("build.copy_data"), patch("build.verify", side_effect=lambda: backup.exists()), \
+                 patch("builtins.input", return_value=""):
+                self.assertEqual(build.main(), 0)
+            self.assertFalse(backup.exists())
+
+    def test_incomplete_build_preserves_backup(self):
+        with TemporaryDirectory() as directory:
+            backup = Path(directory) / "preserved"
+            backup.mkdir()
+            original = backup / "tasks.json"
+            original.write_bytes(b"original user data")
+            with patch("build.PRESERVED_DATA", backup), patch("build.kill_old"), patch("build.clean"), \
+                 patch("build.build_main", return_value=0), patch("build.build_wake", return_value=0), \
+                 patch("build.copy_data"), patch("build.verify", return_value=False), \
+                 patch("builtins.input", return_value=""):
+                self.assertEqual(build.main(), 1)
+            self.assertEqual(original.read_bytes(), b"original user data")
+
+    def test_build_exception_returns_failure_without_running_later_steps(self):
+        with patch("build.kill_old", side_effect=OSError("无法停止旧程序")), patch("build.clean") as clean, \
+             patch("build.build_main") as main, patch("builtins.input", return_value=""):
+            self.assertEqual(build.main(), 1)
+        clean.assert_not_called()
+        main.assert_not_called()
+
+    def test_missing_wake_product_is_not_reported_as_complete(self):
+        with TemporaryDirectory() as directory:
+            output = Path(directory)
+            executable = output / "main.exe"
+            executable.write_bytes(b"MZ")
+            (output / "data").mkdir()
+            with patch("build.DIR_OUT", output), patch("build.MAIN_EXE", executable), \
+                 patch("build.WAKE_EXE", output / "missing.exe"):
+                self.assertFalse(build.verify())
+
     @unittest.skipIf(os.name != "nt", "独占句柄占用是 Windows 文件语义")
     def test_real_exclusive_handle_is_detected_and_released(self):
         with TemporaryDirectory() as directory:

@@ -273,6 +273,8 @@ pip install -r requirements.txt
 python build.py
 ```
 
+任一打包或产物检查步骤失败都会停止后续步骤并返回非零退出码；用户数据备份仅在最终验证通过后释放。
+
 ### 打包结果
 
 ```text
