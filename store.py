@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -120,23 +119,40 @@ class TaskStore:
         backup = None
         try:
             broken = path.read_bytes()
-        except OSError:
-            broken = None
-        if broken is not None:
-            for candidate in sorted(path.parent.glob(f"{path.name}.corrupt-*")):
-                try:
-                    if candidate.is_file() and candidate.read_bytes() == broken:
-                        backup = candidate
-                        break
-                except OSError:
-                    continue
-        if backup is None:
-            backup = path.with_name(f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+        except OSError as error:
+            _LOGGER.warning("  - 备份失败，无法读取原文件：%s，原文件保持原样", error)
+            return
+        for candidate in sorted(path.parent.glob(f"{path.name}.corrupt-*")):
             try:
-                shutil.copy2(path, backup)
-            except OSError as error:
-                _LOGGER.warning("  - 备份失败（%s）：%s，原文件保持原样", backup, error)
-                return
+                if candidate.is_file() and candidate.read_bytes() == broken:
+                    backup = candidate
+                    break
+            except OSError:
+                continue
+        if backup is None:
+            base = f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            suffix = 0
+            while True:
+                backup = path.with_name(base if suffix == 0 else f"{base}-{suffix}")
+                created = False
+                try:
+                    # 独占创建防止同秒留档覆盖；写入的是本次已读原文，而非再次读取变动中的文件。
+                    with backup.open("xb") as handle:
+                        created = True
+                        handle.write(broken)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    break
+                except FileExistsError:
+                    suffix += 1
+                except OSError as error:
+                    if created:
+                        try:
+                            backup.unlink()
+                        except OSError as cleanup_error:
+                            _LOGGER.warning("  - 无法移除不完整备份 %s：%s", backup, cleanup_error)
+                    _LOGGER.warning("  - 备份失败（%s）：%s，原文件保持原样", backup, error)
+                    return
         _LOGGER.warning("  - 原文件未改动，已留档副本：%s", backup)
 
     def _save_json(self, path: Path, payload: dict) -> None:

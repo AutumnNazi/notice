@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import unittest
+from datetime import datetime
 from ctypes import wintypes
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -155,7 +156,7 @@ class TaskFileCorruptionTests(unittest.TestCase):
         path = Path(directory.name) / "tasks.json"
         raw = b'{"tasks": ['
         path.write_bytes(raw)
-        with patch("store.shutil.copy2", side_effect=OSError("磁盘已满")), \
+        with patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
              self.assertLogs("store", level="WARNING") as diagnostics:
             tasks = TaskStore(path).load_tasks()
         self.assertEqual(tasks, [])
@@ -176,6 +177,35 @@ class TaskFileCorruptionTests(unittest.TestCase):
             self.assertEqual(TaskStore(path).load_tasks(), [])
         self.assertEqual(list(path.parent.glob("tasks.json.corrupt-*")), [earlier])
         self.assertIn(earlier.name, "\n".join(diagnostics.output))
+
+    def test_different_corrupt_contents_in_same_second_keep_both_backups(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            contents = (b'{"first": ', b'{"second": ')
+            with patch("store.datetime") as clock, self.assertLogs("store", level="WARNING"):
+                clock.now.return_value = datetime(2026, 10, 18, 13, 10, 0)
+                for raw in contents:
+                    path.write_bytes(raw)
+                    self.assertEqual(TaskStore(path).load_tasks(), [])
+            backups = list(path.parent.glob("tasks.json.corrupt-*"))
+            self.assertEqual(len(backups), 2, "同秒留档不能覆盖之前的损坏原文")
+            self.assertEqual({backup.read_bytes() for backup in backups}, set(contents))
+            self.assertEqual(path.read_bytes(), contents[-1])
+
+    def test_existing_backup_survives_failed_new_backup(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            old = path.with_name("tasks.json.corrupt-20261018-131000")
+            old.write_bytes(b"previous original")
+            raw = b'{"current": '
+            path.write_bytes(raw)
+            with patch("store.datetime") as clock, patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
+                 self.assertLogs("store", level="WARNING"):
+                clock.now.return_value = datetime(2026, 10, 18, 13, 10, 0)
+                self.assertEqual(TaskStore(path).load_tasks(), [])
+            self.assertEqual(old.read_bytes(), b"previous original")
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(list(path.parent.glob("tasks.json.corrupt-*")), [old])
 
     def test_later_save_replaces_corrupt_file_and_keeps_backup(self):
         """读损坏之后的一次正常保存会覆盖原文件，备份是用户找回旧内容的唯一依据。"""
