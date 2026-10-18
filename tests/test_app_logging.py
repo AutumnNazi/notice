@@ -271,6 +271,75 @@ class AppLoggingTests(unittest.TestCase):
                 self.assertEqual(register_font_directory(directory), [path])
             self.assertIn("广播字体更新失败", "\n".join(diagnostics.output))
 
+    def test_reimported_fonts_are_reused_but_remain_available_to_picker(self):
+        import ctypes
+        from core.font_manager import register_font_directories, register_font_directory
+
+        directory = Path(self._temp.name) / "reused-fonts"
+        directory.mkdir()
+        path = directory / "sample.ttf"
+        path.write_bytes(b"test font fixture")
+        windows = MagicMock()
+        windows.gdi32.AddFontResourceExW.return_value = 1
+        with patch.object(ctypes, "windll", windows):
+            self.assertEqual(register_font_directory(directory), [path])
+            self.assertEqual(register_font_directory(directory / "."), [path])
+            self.assertEqual(register_font_directories([directory, directory]), [path])
+        windows.gdi32.AddFontResourceExW.assert_called_once()
+        windows.user32.SendMessageTimeoutW.assert_called_once()
+
+    def test_failed_font_registration_can_retry_and_new_files_are_loaded(self):
+        import ctypes
+        from core.font_manager import register_font_directory
+
+        directory = Path(self._temp.name) / "retry-fonts"
+        directory.mkdir()
+        first = directory / "a.ttf"
+        first.write_bytes(b"test font fixture")
+        windows = MagicMock()
+        windows.gdi32.AddFontResourceExW.side_effect = [0, 1, 1]
+        with patch.object(ctypes, "windll", windows):
+            with self.assertLogs("core.font_manager", level="WARNING"):
+                self.assertEqual(register_font_directory(directory), [])
+            self.assertEqual(register_font_directory(directory), [first])
+            second = directory / "b.otf"
+            second.write_bytes(b"new test font fixture")
+            self.assertEqual(register_font_directory(directory), [first, second])
+        self.assertEqual(windows.gdi32.AddFontResourceExW.call_count, 3)
+        self.assertEqual(windows.user32.SendMessageTimeoutW.call_count, 2)
+
+    def test_concurrent_font_import_does_not_register_same_path_twice(self):
+        import ctypes
+        from core.font_manager import register_font_directory
+
+        directory = Path(self._temp.name) / "concurrent-fonts"
+        directory.mkdir()
+        font = directory / "sample.ttf"
+        font.write_bytes(b"test font fixture")
+        windows = MagicMock()
+        windows.gdi32.AddFontResourceExW.return_value = 1
+        results, errors = [], []
+        barrier = threading.Barrier(3)
+
+        def load():
+            try:
+                barrier.wait(timeout=3)
+                results.append(register_font_directory(directory))
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(ctypes, "windll", windows):
+            workers = [threading.Thread(target=load) for _ in range(3)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(3)
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [[font]] * 3)
+        windows.gdi32.AddFontResourceExW.assert_called_once()
+        windows.user32.SendMessageTimeoutW.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
