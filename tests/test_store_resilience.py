@@ -102,6 +102,34 @@ class TaskFileCorruptionTests(unittest.TestCase):
         self.assertTrue(all(task.id and not task.id.startswith("snooze:") and not task.enabled for task in tasks))
         self.assertIn("不可用", diagnostics)
 
+    def test_invalid_boolean_flags_are_disabled_and_reported(self):
+        for value in ("false", "0", 1, None, [], {}):
+            with self.subTest(value=value):
+                record = {"id": "bad-flag", "trigger_type": "interval",
+                          "trigger_config": {"minutes": 1}, "enabled": value}
+                raw = json.dumps({"tasks": [record]}).encode("utf-8")
+                _path, tasks, diagnostics = self.load(raw)
+                self.assertFalse(tasks[0].enabled)
+                self.assertIn("enabled", diagnostics)
+                with self.assertRaises(ValueError):
+                    Task.from_dict(record)
+
+    def test_valid_boolean_flags_keep_their_original_meaning(self):
+        for enabled in (True, False):
+            for sound in (True, False):
+                with self.subTest(enabled=enabled, sound=sound):
+                    task = Task.from_dict({"trigger_type": "interval", "trigger_config": {"minutes": 1},
+                                           "enabled": enabled, "sound": sound}, strict=False)
+                    self.assertEqual((task.enabled, task.sound), (enabled, sound))
+                    self.assertIsNone(task.load_warning)
+
+    def test_invalid_sound_flag_is_reported_without_enabling_task(self):
+        record = {"id": "bad-sound", "trigger_type": "interval", "trigger_config": {"minutes": 1}, "sound": "false"}
+        _path, tasks, diagnostics = self.load(json.dumps({"tasks": [record]}).encode("utf-8"))
+        self.assertFalse(tasks[0].enabled)
+        self.assertFalse(tasks[0].sound)
+        self.assertIn("sound", diagnostics)
+
     def test_non_object_top_level_returns_empty_list(self):
         raw = b'[{"id": "1"}]'
         path, tasks, stderr = self.load(raw)

@@ -1539,7 +1539,16 @@ class NoticeApp:
             self._sync_from_scheduler()
 
     def _sync_from_scheduler(self) -> None:
-        self._persist_tasks()
+        try:
+            self._persist_tasks()
+        except Exception:
+            # 后台已完成的状态不可回滚；保留重试请求，界面仍显示实际调度状态。
+            if not getattr(self, "_tasks_save_failed", False):
+                logging.getLogger(__name__).exception("后台提醒状态保存失败，将继续重试")
+            self._tasks_save_failed = True
+            self._refresh_queue.put(True)
+        else:
+            self._tasks_save_failed = False
         self._refresh_ui()
 
     def _persist_tasks(self) -> None:

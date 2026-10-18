@@ -49,8 +49,8 @@ class Task:
             body=data.get("body", ""),
             trigger_type=data.get("trigger_type", "once"),
             trigger_config=data.get("trigger_config") or {},
-            enabled=bool(data.get("enabled", True)),
-            sound=bool(data.get("sound", False)),
+            enabled=data.get("enabled", True),
+            sound=data.get("sound", False),
             priority=data.get("priority", "normal"),
             created_at=data.get("created_at", datetime.now().isoformat(timespec="seconds")),
             next_run=data.get("next_run"),
@@ -68,6 +68,11 @@ class Task:
         （TaskScheduler._schedule_task）仍走 strict，负数、全零、未知触发方式照样拒绝。
         """
         problems: list[str] = []
+        for name in ("enabled", "sound"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                problems.append(f"{name} 应为布尔值，实际为 {value!r}")
+                setattr(self, name, False)
         # 字段被写成了别的类型（标题写成数字、id 写成对象）时，后续渲染与搜索按文本处理、
         # 调度器按字典键索引，读取阶段先收敛成程序能处理的类型，避免只是类型不对就让整条不可用。
         if not isinstance(self.id, str):
@@ -93,11 +98,15 @@ class Task:
             self.enabled = False
             self.next_run = None
         if problems:
+            self.enabled = False
+            self.next_run = None
             # 降级不得静默：原因交给 TaskStore 汇总写入运行日志，便于窗口化运行后排查。
             self.load_warning = "；".join(problems)
         return self
 
     def validate(self) -> None:
+        if not isinstance(self.enabled, bool) or not isinstance(self.sound, bool):
+            raise ValueError("enabled 和 sound 必须是布尔值。")
         if self.trigger_type not in TRIGGER_TYPE_VALUES:
             raise ValueError(f"Unsupported trigger type: {self.trigger_type}")
         if not self.title.strip():

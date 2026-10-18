@@ -137,6 +137,31 @@ class ThreadSafeRefreshTests(unittest.TestCase):
         self.app._drain_refresh_requests()
         self.assertEqual(self.calls, ["persist", "refresh"], "没有新请求时不得重复刷新")
 
+    def test_failed_background_save_refreshes_ui_and_retries(self):
+        self.app._persist_tasks = MagicMock(side_effect=[OSError("磁盘已满"), None])
+        self.app._refresh_queue.put(True)
+        with self.assertLogs("gui.app", level="ERROR") as diagnostics:
+            self.app._drain_refresh_requests()
+        self.assertIn("磁盘已满", "\n".join(diagnostics.output))
+        self.assertEqual(self.calls, ["refresh"])
+        self.assertFalse(self.app._refresh_queue.empty())
+        self.app._drain_refresh_requests()
+        self.assertEqual(self.app._persist_tasks.call_count, 2)
+        self.assertEqual(self.calls, ["refresh", "refresh"])
+        self.assertTrue(self.app._refresh_queue.empty())
+
+    def test_persistent_background_save_failure_does_not_flood_logs(self):
+        self.app._persist_tasks = MagicMock(side_effect=[OSError("磁盘已满"), OSError("磁盘已满"), None])
+        self.app._refresh_queue.put(True)
+        with self.assertLogs("gui.app", level="ERROR") as diagnostics:
+            self.app._drain_refresh_requests()
+            self.app._drain_refresh_requests()
+        self.assertEqual(len(diagnostics.output), 1)
+        self.assertEqual(self.calls, ["refresh", "refresh"])
+        self.app._drain_refresh_requests()
+        self.assertFalse(self.app._tasks_save_failed)
+        self.assertTrue(self.app._refresh_queue.empty())
+
 
 class _RealAppTests(unittest.TestCase):
     """需要真实 Tk 主窗口的界面测试；调度器与托盘替身避免真的排程和起托盘线程。"""
