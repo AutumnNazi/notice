@@ -82,6 +82,15 @@ class TaskFileCorruptionTests(unittest.TestCase):
         self.assertEqual(tasks, [])
         self.assert_quarantined(path, raw, diagnostics, "UTF-8")
 
+    def test_unsupported_json_numbers_are_quarantined_and_safe_to_save(self):
+        for value in ("NaN", "Infinity", "-Infinity", "1e999", "9" * 5000):
+            with self.subTest(value=value[:20]):
+                raw = ('{"tasks": [], "number": ' + value + '}').encode("ascii")
+                path, tasks, diagnostics = self.load(raw)
+                self.assertEqual(tasks, [])
+                self.assert_quarantined(path, raw, diagnostics, "JSON")
+                TaskStore(path).save_tasks(tasks)
+
     def test_duplicate_ids_preserve_both_records_without_schedule_collision(self):
         records = [{"id": "same", "title": title, "trigger_type": "interval",
                     "trigger_config": {"hours": 1}} for title in ("第一条", "第二条")]
@@ -296,6 +305,20 @@ class SettingsFileCorruptionTests(unittest.TestCase):
             store.save_tasks(store.load_tasks())
             store.save_settings(store.load_settings(settings_path), settings_path)
             self.assertEqual(list(Path(directory).glob("*.corrupt-*")), [])
+
+    def test_finite_json_numbers_roundtrip_but_nonfinite_settings_are_backed_up(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = TaskStore(path)
+            values = {"number": 1.25, "negative": -2.5, "large": 1e100, "integer": 123}
+            store.save_settings(values, path)
+            loaded = store.load_settings(path)
+            self.assertTrue(all(loaded[key] == value for key, value in values.items()))
+            raw = b'{"number": NaN}'
+            path.write_bytes(raw)
+            with self.assertLogs("store", level="WARNING"):
+                self.assertEqual(store.load_settings(path), SETTINGS_DEFAULTS)
+            self.assertEqual([p.read_bytes() for p in path.parent.glob("settings.json.corrupt-*")], [raw])
 
 
 class BuildLockProbeTests(unittest.TestCase):

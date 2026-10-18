@@ -999,6 +999,27 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_extreme_interval_is_disabled_without_interrupting_healthy_tasks(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        broken = Task(id="overflow-interval", trigger_type="interval", trigger_config={"days": 10 ** 15})
+        healthy = Task(id="healthy-interval", trigger_type="interval", trigger_config={"minutes": 1})
+        scheduler.sync_tasks([broken, healthy])
+        self.assertFalse(broken.enabled)
+        self.assertIsNone(scheduler.task_next_run(broken.id))
+        self.assertIsNotNone(scheduler.task_next_run(healthy.id))
+        broken.enabled = True
+        with self.assertRaises(ValueError):
+            broken.validate()
+
+    def test_interval_date_overflow_and_infinity_are_validation_errors(self):
+        for values in ({"days": 4_000_000}, {"seconds": float("inf")}):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    Task(trigger_type="interval", trigger_config=values).validate()
+        Task(trigger_type="interval", trigger_config={"weeks": 52, "seconds": 1}).validate()
+
     def test_notification_text_is_data_and_child_failure_is_reported(self):
         import base64
         import xml.etree.ElementTree as ET

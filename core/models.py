@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -12,11 +12,19 @@ TRIGGER_TYPE_VALUES = {"once", "interval", "weekly", "weekly_last_workday", "yea
 
 
 def validate_interval_config(config: dict[str, Any]) -> dict[str, int]:
-    values = {key: int(config.get(key, 0)) for key in ("weeks", "days", "hours", "minutes", "seconds")}
+    try:
+        values = {key: int(config.get(key, 0)) for key in ("weeks", "days", "hours", "minutes", "seconds")}
+    except OverflowError as exc:
+        raise ValueError("循环间隔数值超出有效范围。") from exc
     if any(value < 0 for value in values.values()):
         raise ValueError("循环间隔不能为负数。")
     if not any(values.values()):
         raise ValueError("循环间隔至少有一项大于 0。")
+    try:
+        # 调度器会以当前时间加间隔作为首次触发，间隔和结果日期都必须可表示。
+        datetime.now() + timedelta(**values)
+    except OverflowError as exc:
+        raise ValueError("循环间隔超出可调度的日期范围。") from exc
     return values
 
 

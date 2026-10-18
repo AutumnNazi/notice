@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,13 @@ from core.models import Task
 
 
 _LOGGER = get_logger(__name__)
+
+
+def _finite_json_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"JSON 数值必须有限：{value}")
+    return number
 
 
 class TaskStore:
@@ -93,11 +101,11 @@ class TaskStore:
         """
         try:
             with path.open("r", encoding="utf-8-sig") as handle:
-                data = json.load(handle)
+                data = json.load(handle, parse_float=_finite_json_number, parse_constant=_finite_json_number)
         except UnicodeDecodeError as error:
             self._quarantine(path, label, f"UTF-8 解码失败：{error}")
             return None
-        except json.JSONDecodeError as error:
+        except ValueError as error:
             self._quarantine(path, label, f"JSON 解析失败：{error}")
             return None
         except OSError as error:
