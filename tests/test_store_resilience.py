@@ -76,6 +76,29 @@ class TaskFileCorruptionTests(unittest.TestCase):
         self.assertEqual(tasks, [])
         self.assert_quarantined(path, raw, stderr, "JSON")
 
+    def test_duplicate_json_keys_are_archived_instead_of_overriding_task_rules(self):
+        raw = (b'{"tasks":[{"id":"duplicate-key","trigger_type":"interval",'
+               b'"trigger_config":{"minutes":5,"minutes":1},"enabled":false,"enabled":true}]}')
+        path, tasks, diagnostics = self.load(raw)
+        self.assertEqual(tasks, [])
+        self.assert_quarantined(path, raw, diagnostics, "重复")
+        TaskStore(path).save_tasks(tasks)
+        self.assertEqual([p.read_bytes() for p in path.parent.glob("tasks.json.corrupt-*")], [raw])
+
+    def test_same_keys_in_separate_task_objects_remain_valid(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            records = [{"id": task_id, "title": "合法提醒", "trigger_type": "interval",
+                        "trigger_config": {"minutes": minutes}, "enabled": enabled}
+                       for task_id, minutes, enabled in (("first", 5, False), ("second", 1, True))]
+            path.write_text(json.dumps({"tasks": records}, ensure_ascii=False), encoding="utf-8")
+            store = TaskStore(path)
+            tasks = store.load_tasks()
+            self.assertEqual([(task.id, task.enabled, task.trigger_config["minutes"]) for task in tasks],
+                             [("first", False, 5), ("second", True, 1)])
+            store.save_tasks(tasks)
+            self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+
     def test_invalid_utf8_returns_empty_list_and_preserves_original(self):
         raw = b'{"tasks": [], "bad": "\xff"}'
         path, tasks, diagnostics = self.load(raw)
@@ -353,6 +376,7 @@ class SettingsFileCorruptionTests(unittest.TestCase):
         cases = {
             "非法 JSON": b'{"font_family": ',
             "非法 UTF-8": b'{"font_family": "\xff"}',
+            "重复关闭选项": b'{"close_action":"tray","close_action":"exit"}',
             "顶层是数组": b'["font_family"]',
             "顶层是字符串": b'"font_family"',
             "顶层是 null": b"null",

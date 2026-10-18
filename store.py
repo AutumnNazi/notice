@@ -22,6 +22,15 @@ def _finite_json_number(value: str) -> float:
     return number
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 对象包含重复字段：{key!r}")
+        result[key] = value
+    return result
+
+
 class TaskStore:
     def __init__(self, path: Path = TASKS_FILE) -> None:
         self.path = path
@@ -101,7 +110,8 @@ class TaskStore:
         """
         try:
             with path.open("r", encoding="utf-8-sig") as handle:
-                data = json.load(handle, parse_float=_finite_json_number, parse_constant=_finite_json_number)
+                data = json.load(handle, parse_float=_finite_json_number, parse_constant=_finite_json_number,
+                                 object_pairs_hook=_unique_json_object)
         except UnicodeDecodeError as error:
             self._quarantine(path, label, f"UTF-8 解码失败：{error}")
             return None
