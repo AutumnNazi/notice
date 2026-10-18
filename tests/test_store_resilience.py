@@ -216,6 +216,30 @@ class TaskFileCorruptionTests(unittest.TestCase):
         backups = list(path.parent.glob("tasks.json.corrupt-*"))
         self.assertEqual([backup.read_bytes() for backup in backups], [raw])
 
+    def test_skipped_record_is_backed_up_before_later_save(self):
+        raw = json.dumps({"tasks": ["原始异常记录", {"id": "healthy", "trigger_type": "interval",
+                                                   "trigger_config": {"minutes": 1}}]}, ensure_ascii=False).encode("utf-8")
+        path, tasks, _diagnostics = self.load(raw)
+        self.assertEqual(len(tasks), 1)
+        TaskStore(path).save_tasks(tasks)
+        self.assertEqual([p.read_bytes() for p in path.parent.glob("tasks.json.corrupt-*")], [raw])
+
+    def test_failed_backup_blocks_overwrite_until_original_is_protected(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            raw = b'{"tasks": ['
+            path.write_bytes(raw)
+            store = TaskStore(path)
+            with patch("store.os.fsync", side_effect=OSError("磁盘已满")), self.assertLogs("store", level="WARNING"):
+                tasks = store.load_tasks()
+                with self.assertRaises(OSError):
+                    store.save_tasks(tasks)
+            self.assertEqual(path.read_bytes(), raw)
+            with self.assertLogs("store", level="WARNING"):
+                store.save_tasks(tasks)
+            self.assertEqual([p.read_bytes() for p in path.parent.glob("tasks.json.corrupt-*")], [raw])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"tasks": []})
+
 
 class SettingsFileCorruptionTests(unittest.TestCase):
     """settings.json 整体损坏时回退默认设置，不能让窗口化启动直接崩。"""
@@ -245,6 +269,33 @@ class SettingsFileCorruptionTests(unittest.TestCase):
                 stderr_text = "\n".join(diagnostics.output)
                 self.assertIn(str(path), stderr_text)
                 self.assertIn(backups[0].name, stderr_text)
+
+    def test_failed_settings_backup_blocks_default_save_until_protected(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            raw = b'{"font_family": '
+            path.write_bytes(raw)
+            store = TaskStore(path)
+            with patch("store.os.fsync", side_effect=OSError("磁盘已满")), self.assertLogs("store", level="WARNING"):
+                settings = store.load_settings(path)
+                with self.assertRaises(OSError):
+                    store.save_settings(settings, path)
+            self.assertEqual(path.read_bytes(), raw)
+            with self.assertLogs("store", level="WARNING"):
+                store.save_settings(settings, path)
+            self.assertEqual([p.read_bytes() for p in path.parent.glob("settings.json.corrupt-*")], [raw])
+            self.assertEqual(store.load_settings(path), SETTINGS_DEFAULTS)
+
+    def test_healthy_files_do_not_create_corruption_backups(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            settings_path = Path(directory) / "settings.json"
+            store = TaskStore(path)
+            store.save_tasks([Task(trigger_type="interval", trigger_config={"minutes": 1})])
+            store.save_settings(SETTINGS_DEFAULTS, settings_path)
+            store.save_tasks(store.load_tasks())
+            store.save_settings(store.load_settings(settings_path), settings_path)
+            self.assertEqual(list(Path(directory).glob("*.corrupt-*")), [])
 
 
 class BuildLockProbeTests(unittest.TestCase):

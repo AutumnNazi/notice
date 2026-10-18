@@ -17,6 +17,7 @@ _LOGGER = get_logger(__name__)
 class TaskStore:
     def __init__(self, path: Path = TASKS_FILE) -> None:
         self.path = path
+        self._unprotected_paths: set[Path] = set()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     def load_tasks(self) -> list[Task]:
@@ -66,6 +67,7 @@ class TaskStore:
             _LOGGER.warning("[提醒数据] %s 条记录读取异常，已降级为停用或跳过：", len(problems))
             for message in problems:
                 _LOGGER.warning("  - %s", message)
+            self._quarantine(self.path, "提醒数据", "存在异常条目，保存容错结果前保留完整原文")
         return tasks
 
     def save_tasks(self, tasks: list[Task]) -> None:
@@ -101,13 +103,14 @@ class TaskStore:
         except OSError as error:
             # 文件被占用或权限不足时连备份都读不出来，这里只提示、不改动也无法改动原文件。
             _LOGGER.warning("[%s] 读取 %s 失败，本次已改用安全默认值：%s", label, path, error)
+            self._unprotected_paths.add(path)
             return None
         if not isinstance(data, dict):
             self._quarantine(path, label, f"顶层应为 JSON 对象，实际是 {type(data).__name__}")
             return None
         return data
 
-    def _quarantine(self, path: Path, label: str, reason: str) -> None:
+    def _quarantine(self, path: Path, label: str, reason: str) -> bool:
         """损坏文件只复制留档、绝不删改，用户可能想手工修回里面的内容。
 
         下一次正常保存就会覆盖原文件，所以先按时间戳留一份副本；同一份内容已留过档就不再
@@ -116,12 +119,13 @@ class TaskStore:
         """
         _LOGGER.warning("[%s] %s 内容损坏，本次已改用安全默认值", label, path)
         _LOGGER.warning("  - 原因：%s", reason)
+        self._unprotected_paths.add(path)
         backup = None
         try:
             broken = path.read_bytes()
         except OSError as error:
             _LOGGER.warning("  - 备份失败，无法读取原文件：%s，原文件保持原样", error)
-            return
+            return False
         for candidate in sorted(path.parent.glob(f"{path.name}.corrupt-*")):
             try:
                 if candidate.is_file() and candidate.read_bytes() == broken:
@@ -152,13 +156,18 @@ class TaskStore:
                         except OSError as cleanup_error:
                             _LOGGER.warning("  - 无法移除不完整备份 %s：%s", backup, cleanup_error)
                     _LOGGER.warning("  - 备份失败（%s）：%s，原文件保持原样", backup, error)
-                    return
+                    return False
+        self._unprotected_paths.discard(path)
         _LOGGER.warning("  - 原文件未改动，已留档副本：%s", backup)
+        return True
 
     def _save_json(self, path: Path, payload: dict) -> None:
         # 完整写入并落盘后才替换原文件；失败时旧提醒和设置仍然可读。
         text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path in self._unprotected_paths and path.exists():
+            if not self._quarantine(path, "本地数据", "重新尝试留档，成功前禁止覆盖原文件"):
+                raise OSError(f"原文件尚未成功留档，拒绝覆盖：{path}")
         previous = path.read_bytes() if path.exists() else b""
         encoding = "utf-8-sig" if previous.startswith(b"\xef\xbb\xbf") else "utf-8"
         newline = "\r\n" if b"\r\n" in previous else "\n"
@@ -172,6 +181,7 @@ class TaskStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             temporary.replace(path)
+            self._unprotected_paths.discard(path)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
