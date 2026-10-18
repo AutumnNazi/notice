@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from apscheduler.triggers.cron import CronTrigger
+
 from config import DEFAULT_TITLE
 
 
@@ -160,3 +162,20 @@ class Task:
         if self.trigger_type == "interval":
             validate_interval_config(self.trigger_config)
         validate_calendar_config(self.trigger_type, self.trigger_config)
+        if self.trigger_type in {"once", "cron"}:
+            if not isinstance(self.trigger_config, dict):
+                raise ValueError("提醒时间配置必须是对象。")
+            if self.trigger_type == "once":
+                date_value = self.trigger_config.get("date")
+                time_value = self.trigger_config.get("time")
+                if not isinstance(date_value, str) or not isinstance(time_value, str):
+                    raise ValueError("单次提醒日期与时间必须是文本。")
+                try:
+                    datetime.fromisoformat(f"{date_value}T{time_value}")
+                except ValueError as exc:
+                    raise ValueError("单次提醒日期或时间无效。") from exc
+            else:
+                expression = self.trigger_config.get("expression")
+                if not isinstance(expression, str):
+                    raise ValueError("Cron 表达式必须是文本。")
+                CronTrigger.from_crontab(expression)

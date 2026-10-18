@@ -1109,6 +1109,17 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_invalid_cron_type_is_isolated_without_interrupting_healthy_schedule(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        invalid = Task(id="numeric-cron", trigger_type="cron", trigger_config={"expression": 7})
+        healthy = Task(id="healthy-cron", trigger_type="cron", trigger_config={"expression": "*/5 * * * *"})
+        scheduler.sync_tasks([invalid, healthy])
+        self.assertFalse(invalid.enabled)
+        self.assertIsNone(scheduler._scheduler.get_job(invalid.id))
+        self.assertIsNotNone(scheduler.task_next_run(healthy.id))
+
     def test_queued_old_dispatch_does_not_fire_future_edited_reminder(self):
         scheduler = TaskScheduler(MagicMock())
         scheduler.start()

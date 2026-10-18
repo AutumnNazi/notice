@@ -157,6 +157,40 @@ class TaskFileCorruptionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Task.from_dict(record)
 
+    def test_invalid_once_and_cron_records_are_disabled_and_archived(self):
+        cases = [("once", {"date": "2026-02-30", "time": "09:00"}),
+                 ("once", {}), ("once", {"date": 20261018, "time": "09:00"}),
+                 ("cron", {"expression": "invalid cron"}), ("cron", {"expression": 7}),
+                 ("cron", {"expression": None}), ("cron", {})]
+        for kind, config in cases:
+            with self.subTest(kind=kind, config=config):
+                record = {"id": "bad-once-cron", "trigger_type": kind, "trigger_config": config}
+                raw = json.dumps({"tasks": [record]}).encode("utf-8")
+                path, tasks, diagnostics = self.load(raw)
+                self.assertFalse(tasks[0].enabled)
+                self.assertEqual(tasks[0].trigger_config, config)
+                self.assertIsNotNone(tasks[0].load_warning)
+                self.assertIn("bad-once-cron", diagnostics)
+                self.assertEqual([p.read_bytes() for p in path.parent.glob("tasks.json.corrupt-*")], [raw])
+                with self.assertRaises(ValueError):
+                    Task.from_dict(record)
+
+    def test_valid_once_and_cron_formats_roundtrip_without_corruption_backup(self):
+        cases = [("once", {"date": "2020-01-01", "time": "09:00"}),
+                 ("once", {"date": "2090-01-01", "time": "09:00:00+08:00"}),
+                 ("cron", {"expression": "*/5 9-18 * * mon-fri"})]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            records = [{"id": str(index), "trigger_type": kind, "trigger_config": config}
+                       for index, (kind, config) in enumerate(cases)]
+            path.write_text(json.dumps({"tasks": records}), encoding="utf-8")
+            store = TaskStore(path)
+            tasks = store.load_tasks()
+            self.assertTrue(all(task.enabled and task.load_warning is None for task in tasks))
+            store.save_tasks(tasks)
+            self.assertEqual([task.trigger_config for task in store.load_tasks()], [config for _, config in cases])
+            self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+
     def test_valid_calendar_records_keep_enabled_state_and_do_not_create_backup(self):
         cases = [("yearly", {"month": "2", "day": "29", "hour": "9"}),
                  ("weekly", {"weekdays": [0, 6], "hour": 9}),
