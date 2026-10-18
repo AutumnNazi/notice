@@ -191,6 +191,21 @@ class TaskFileCorruptionTests(unittest.TestCase):
             self.assertEqual([task.trigger_config for task in store.load_tasks()], [config for _, config in cases])
             self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
 
+    def test_cron_with_no_possible_date_is_disabled_and_archived(self):
+        for expression in ("0 9 30 2 *", "0 9 31 4 *"):
+            with self.subTest(expression=expression):
+                config = {"expression": expression}
+                record = {"id": "impossible-cron", "title": "无解周期", "trigger_type": "cron",
+                          "trigger_config": config, "enabled": True}
+                raw = json.dumps({"tasks": [record]}, ensure_ascii=False).encode("utf-8")
+                path, tasks, diagnostics = self.load(raw)
+                self.assertFalse(tasks[0].enabled)
+                self.assertEqual(tasks[0].trigger_config, config)
+                self.assertIn("未来触发", diagnostics)
+                self.assertEqual([p.read_bytes() for p in path.parent.glob("tasks.json.corrupt-*")], [raw])
+                with self.assertRaisesRegex(ValueError, "未来触发"):
+                    Task.from_dict(record)
+
     def test_valid_calendar_records_keep_enabled_state_and_do_not_create_backup(self):
         cases = [("yearly", {"month": "2", "day": "29", "hour": "9"}),
                  ("weekly", {"weekdays": [0, 6], "hour": 9}),

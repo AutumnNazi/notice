@@ -178,4 +178,6 @@ class Task:
                 expression = self.trigger_config.get("expression")
                 if not isinstance(expression, str):
                     raise ValueError("Cron 表达式必须是文本。")
-                CronTrigger.from_crontab(expression)
+                trigger = CronTrigger.from_crontab(expression)
+                if trigger.get_next_fire_time(None, datetime.now(trigger.timezone)) is None:
+                    raise ValueError("Cron 表达式不存在可用的未来触发日期。")

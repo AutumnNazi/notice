@@ -1109,6 +1109,38 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_cron_rejects_impossible_date_but_keeps_leap_day_and_month_ranges(self):
+        scheduler = TaskScheduler(MagicMock())
+        for expression in ("0 9 30 2 *", "0 9 31 4 *"):
+            with self.subTest(expression=expression), self.assertRaisesRegex(ValueError, "未来触发"):
+                scheduler._build_trigger(Task(trigger_type="cron", trigger_config={"expression": expression}))
+        for expression in ("0 9 29 2 *", "0 9 31 2,3 *", "*/5 * * * *"):
+            with self.subTest(expression=expression):
+                trigger = scheduler._build_trigger(Task(trigger_type="cron", trigger_config={"expression": expression}))
+                self.assertIsNotNone(trigger.get_next_fire_time(None, datetime.now(trigger.timezone)))
+
+    def test_impossible_cron_is_isolated_and_editor_does_not_accept_it(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        invalid = Task(id="cron-no-date", trigger_type="cron", trigger_config={"expression": "0 9 30 2 *"})
+        healthy = Task(id="cron-with-date", trigger_type="cron", trigger_config={"expression": "*/5 * * * *"})
+        scheduler.sync_tasks([invalid, healthy])
+        self.assertFalse(invalid.enabled)
+        self.assertIsNotNone(scheduler.task_next_run(healthy.id))
+        dialog = SimpleNamespace(
+            trigger_type_var=SimpleNamespace(get=lambda: "cron"),
+            _collect_trigger_config=lambda _kind: invalid.trigger_config,
+            body_text=None, title_var=SimpleNamespace(get=lambda: "合法标题"),
+            body_var=SimpleNamespace(get=lambda: ""), enabled_var=SimpleNamespace(get=lambda: True),
+            _task=None, result=None, destroy=MagicMock(),
+        )
+        with patch("gui.task_dialog.show_error") as error:
+            TaskDialog._save(dialog)
+        self.assertIsNone(dialog.result)
+        dialog.destroy.assert_not_called()
+        error.assert_called_once()
+
     def test_invalid_cron_type_is_isolated_without_interrupting_healthy_schedule(self):
         scheduler = TaskScheduler(MagicMock())
         scheduler.start()
