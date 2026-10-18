@@ -98,7 +98,7 @@ class TaskScheduler:
         with self._lock, self._scheduler._jobstores_lock:
             previous = self._tasks.get(task_id)
             request = self._snooze_requests.get(task_id)
-            state = (previous.enabled, previous.next_run) if previous else None
+            state = (previous.enabled, previous.next_run, previous.retry_at) if previous else None
             jobs = {key: self._scheduler.get_job(key)
                     for key in (task_id, self._snooze_job_id(task_id))}
             try:
@@ -112,7 +112,7 @@ class TaskScheduler:
                     self._tasks.pop(task_id, None)
                 else:
                     self._tasks[task_id] = previous
-                    previous.enabled, previous.next_run = state
+                    previous.enabled, previous.next_run, previous.retry_at = state
                 for key, job in jobs.items():
                     current = self._scheduler.get_job(key)
                     if current is job:
@@ -195,11 +195,12 @@ class TaskScheduler:
             # 用户改好并重新启用时才会走到下面的严格校验。
             self._remove_job(task.id)
             task.next_run = None
+            task.retry_at = None
             return
         task.validate()
         if task.trigger_type == "once":
             run_at = datetime.fromisoformat(f"{task.trigger_config['date']}T{task.trigger_config['time']}")
-            if run_at <= datetime.now(run_at.tzinfo):
+            if task.retry_at is None and run_at <= datetime.now(run_at.tzinfo):
                 self._remove_job(task.id)
                 task.enabled = False
                 task.next_run = None
@@ -293,12 +294,15 @@ class TaskScheduler:
                 if failure is None:
                     task.enabled = False
                     task.next_run = None
+                    task.retry_at = None
                 else:
                     # 单次 job 已被调度器取走；临时发送失败要重试，不能假装已提醒并停用。
+                    retry_time = datetime.now().astimezone() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)
                     self._scheduler.add_job(
-                        self._run_task, DateTrigger(run_date=datetime.now() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)),
+                        self._run_task, DateTrigger(run_date=retry_time),
                         id=task.id, args=[task.id, task], replace_existing=True, misfire_grace_time=None,
                     )
+                    task.retry_at = retry_time.isoformat()
                     task.next_run = self.task_next_run(task.id)
             elif task.trigger_type == "weekly_last_workday" and task.enabled:
                 self._schedule_task(task)
@@ -337,7 +341,7 @@ class TaskScheduler:
         task.validate()
         config = task.trigger_config
         if task.trigger_type == "once":
-            run_at = datetime.fromisoformat(f"{config['date']}T{config['time']}")
+            run_at = datetime.fromisoformat(task.retry_at or f"{config['date']}T{config['time']}")
             return DateTrigger(run_date=run_at)
         if task.trigger_type == "interval":
             return IntervalTrigger(

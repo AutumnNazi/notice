@@ -1170,6 +1170,108 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_failed_once_retry_survives_save_reload_and_then_succeeds(self):
+        with TemporaryDirectory() as directory:
+            store = TaskStore(Path(directory) / "tasks.json")
+            notifier = MagicMock()
+            notifier.send.side_effect = OSError("临时发送失败")
+            scheduler = TaskScheduler(notifier)
+            failed = Event()
+            scheduler._scheduler.add_listener(lambda _event: failed.set(), EVENT_JOB_ERROR)
+            scheduler.start()
+            try:
+                when = datetime.now() + timedelta(seconds=1)
+                task = Task(id="persist-once-retry", trigger_type="once",
+                            trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+                scheduler.upsert_task(task)
+                self.assertTrue(failed.wait(5))
+                self.assertTrue(task.enabled)
+                retry_time = scheduler._scheduler.get_job(task.id).next_run_time
+                store.save_tasks([task])
+            finally:
+                scheduler.shutdown()
+
+            restarted = TaskScheduler(MagicMock())
+            completed = Event()
+            restarted._scheduler.add_listener(lambda _event: completed.set(), EVENT_JOB_EXECUTED)
+            restarted.start()
+            try:
+                restored = store.load_tasks()[0]
+                restarted.sync_tasks([restored])
+                self.assertTrue(restored.enabled, "待重试单次提醒不能在重启时按原日期停用")
+                job = restarted._scheduler.get_job(restored.id)
+                self.assertIsNotNone(job)
+                self.assertEqual(job.next_run_time, retry_time)
+                restarted._scheduler.modify_job(restored.id, next_run_time=datetime.now(job.next_run_time.tzinfo))
+                self.assertTrue(completed.wait(5))
+                restarted.notifier.send.assert_called_once_with(restored)
+                self.assertFalse(restored.enabled)
+                self.assertIsNone(restored.retry_at)
+                store.save_tasks([restored])
+                self.assertIsNone(store.load_tasks()[0].retry_at)
+            finally:
+                restarted.shutdown()
+
+    def test_expired_once_without_retry_stays_disabled_and_overdue_retry_is_replayed(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        old_time = datetime.now().astimezone() - timedelta(hours=1)
+        config = {"date": old_time.date().isoformat(), "time": old_time.timetz().isoformat()}
+        expired = Task(id="ordinary-expired", trigger_type="once", trigger_config=config)
+        pending = Task(id="overdue-retry", trigger_type="once", trigger_config=config,
+                       retry_at=old_time.isoformat())
+        finished = Event()
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_EXECUTED)
+        scheduler.sync_tasks([expired, pending])
+        self.assertFalse(expired.enabled)
+        self.assertIsNone(scheduler._scheduler.get_job(expired.id))
+        self.assertTrue(finished.wait(5))
+        scheduler.notifier.send.assert_called_once_with(pending)
+        self.assertFalse(pending.enabled)
+        self.assertIsNone(pending.retry_at)
+
+    def test_disabled_once_clears_retry_and_failed_transaction_restores_it(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        old_time = datetime.now().astimezone() - timedelta(hours=1)
+        retry_time = datetime.now().astimezone() + timedelta(minutes=1)
+        task = Task(id="disable-retry", trigger_type="once",
+                    trigger_config={"date": old_time.date().isoformat(), "time": old_time.timetz().isoformat()},
+                    retry_at=retry_time.isoformat())
+        scheduler.upsert_task(task)
+        with self.assertRaises(OSError):
+            with scheduler.task_transaction(task.id):
+                task.enabled = False
+                scheduler.upsert_task(task, notify=False)
+                self.assertIsNone(task.retry_at)
+                raise OSError("停用保存失败")
+        self.assertTrue(task.enabled)
+        self.assertEqual(task.retry_at, retry_time.isoformat())
+        self.assertEqual(scheduler._scheduler.get_job(task.id).next_run_time, retry_time)
+        task.enabled = False
+        scheduler.upsert_task(task)
+        self.assertIsNone(task.retry_at)
+
+    def test_editor_changes_clear_previous_once_retry(self):
+        old_time = datetime.now().astimezone() - timedelta(hours=1)
+        retry_time = datetime.now().astimezone() + timedelta(minutes=1)
+        old = Task(id="edit-retry", trigger_type="once",
+                   trigger_config={"date": old_time.date().isoformat(), "time": old_time.timetz().isoformat()},
+                   retry_at=retry_time.isoformat())
+        dialog = SimpleNamespace(
+            trigger_type_var=SimpleNamespace(get=lambda: "interval"),
+            _collect_trigger_config=lambda _kind: {"minutes": 5},
+            body_text=None, title_var=SimpleNamespace(get=lambda: "新周期"),
+            body_var=SimpleNamespace(get=lambda: ""), enabled_var=SimpleNamespace(get=lambda: True),
+            _task=old, result=None, destroy=MagicMock(),
+        )
+        with patch("gui.task_dialog.show_error") as error:
+            TaskDialog._save(dialog)
+        error.assert_not_called()
+        self.assertIsNone(dialog.result.retry_at)
+
     def test_unchanged_notification_shortcut_is_not_rewritten(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

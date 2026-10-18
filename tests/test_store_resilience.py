@@ -258,6 +258,20 @@ class TaskFileCorruptionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     Task.from_dict(record)
 
+    def test_invalid_retry_timestamp_is_disabled_and_archived(self):
+        for retry_at in ("invalid date", 7, {}):
+            with self.subTest(retry_at=retry_at):
+                record = {"id": "retry-field", "trigger_type": "once",
+                          "trigger_config": {"date": "2020-01-01", "time": "09:00"}, "retry_at": retry_at}
+                raw = json.dumps({"tasks": [record]}).encode("utf-8")
+                path, tasks, diagnostics = self.load(raw)
+                self.assertFalse(tasks[0].enabled)
+                self.assertIsNone(tasks[0].retry_at)
+                self.assertIn("retry_at", diagnostics)
+                self.assertEqual([p.read_bytes() for p in path.parent.glob("*.corrupt-*")], [raw])
+                with self.assertRaises(ValueError):
+                    Task.from_dict(record)
+
     def test_valid_once_and_cron_formats_roundtrip_without_corruption_backup(self):
         cases = [("once", {"date": "2020-01-01", "time": "09:00"}),
                  ("once", {"date": "2090-01-01", "time": "09:00:00+08:00"}),

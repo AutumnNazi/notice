@@ -89,6 +89,7 @@ class Task:
     priority: str = "normal"
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     next_run: str | None = None
+    retry_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -111,6 +112,7 @@ class Task:
             priority=data.get("priority", "normal"),
             created_at=data.get("created_at", datetime.now().isoformat(timespec="seconds")),
             next_run=data.get("next_run"),
+            retry_at=data.get("retry_at"),
         )
         if strict:
             task.validate()
@@ -157,12 +159,20 @@ class Task:
         if problems:
             self.enabled = False
             self.next_run = None
+            self.retry_at = None
             # 降级不得静默：原因交给 TaskStore 汇总写入运行日志，便于窗口化运行后排查。
             self.load_warning = "；".join(problems)
         return self
 
     def validate(self) -> None:
         validate_notification_text(self.title, self.body)
+        if self.retry_at is not None:
+            if self.trigger_type != "once" or not isinstance(self.retry_at, str):
+                raise ValueError("retry_at 必须是单次提醒的有效重试时间。")
+            try:
+                datetime.fromisoformat(self.retry_at)
+            except ValueError as exc:
+                raise ValueError("retry_at 重试时间无效。") from exc
         if not isinstance(self.enabled, bool) or not isinstance(self.sound, bool):
             raise ValueError("enabled 和 sound 必须是布尔值。")
         if self.trigger_type not in TRIGGER_TYPE_VALUES:
