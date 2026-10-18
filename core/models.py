@@ -33,6 +33,37 @@ def validate_interval_config(config: dict[str, Any]) -> dict[str, int]:
     return values
 
 
+def validate_calendar_config(trigger_type: str, config: dict[str, Any]) -> None:
+    if trigger_type not in {"weekly", "weekly_last_workday", "yearly"}:
+        return
+    if not isinstance(config, dict):
+        raise ValueError("提醒时间配置必须是对象。")
+    values: dict[str, int] = {}
+    fields = ("hour", "minute", "second", "month", "day") if trigger_type == "yearly" else ("hour", "minute", "second")
+    for key in fields:
+        default = 18 if key == "hour" and trigger_type == "weekly_last_workday" else 0
+        raw = config.get(key, default)
+        if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+            raise ValueError(f"{key} 必须是整数，不能使用布尔值或小数。")
+        try:
+            values[key] = int(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{key} 必须是有效整数。") from exc
+    if not (0 <= values["hour"] <= 23 and 0 <= values["minute"] <= 59 and 0 <= values["second"] <= 59):
+        raise ValueError("提醒时间须在 00:00:00 至 23:59:59 之间。")
+    if trigger_type == "yearly":
+        # 用闰年校验月日，允许 2 月 29 日，但不接受永远不会到来的日期。
+        try:
+            datetime(2000, values["month"], values["day"])
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("提醒月日不是有效日期。") from exc
+    if trigger_type == "weekly":
+        weekdays = config.get("weekdays")
+        if not isinstance(weekdays, list) or not weekdays or any(
+                type(day) is not int or not 0 <= day <= 6 for day in weekdays):
+            raise ValueError("星期必须是包含 0 至 6 整数的非空数组。")
+
+
 @dataclass
 class Task:
     id: str = field(default_factory=lambda: uuid4().hex)

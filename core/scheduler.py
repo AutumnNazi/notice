@@ -12,7 +12,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from chinese_calendar import is_workday
 
 from core.app_logging import get_logger
-from core.models import Task
+from core.models import Task, validate_calendar_config
 from core.notifier import Notifier
 
 _LOGGER = get_logger(__name__)
@@ -249,6 +249,7 @@ class TaskScheduler:
     def _build_trigger(self, task: Task):
         task.validate()
         config = task.trigger_config
+        validate_calendar_config(task.trigger_type, config)
         if task.trigger_type == "once":
             run_at = datetime.fromisoformat(f"{config['date']}T{config['time']}")
             return DateTrigger(run_date=run_at)

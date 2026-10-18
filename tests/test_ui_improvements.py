@@ -999,6 +999,50 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_calendar_configs_reject_impossible_dates_and_ambiguous_numbers(self):
+        scheduler = TaskScheduler(MagicMock())
+        cases = [("yearly", {"month": 2, "day": 30}),
+                 ("weekly", {"weekdays": "10", "hour": 9}),
+                 ("weekly", {"weekdays": [0], "hour": 9.9}),
+                 ("weekly", {"weekdays": [True], "hour": 9}),
+                 ("weekly_last_workday", {"hour": True})]
+        for kind, config in cases:
+            with self.subTest(kind=kind, config=config), self.assertRaises(ValueError):
+                scheduler._build_trigger(Task(trigger_type=kind, trigger_config=config))
+
+    def test_calendar_configs_keep_leap_day_and_integer_string_times(self):
+        scheduler = TaskScheduler(MagicMock())
+        task = Task(trigger_type="yearly", trigger_config={"month": "2", "day": "29", "hour": "9"})
+        trigger = scheduler._build_trigger(task)
+        next_run = trigger.get_next_fire_time(None, datetime(2026, 10, 18, tzinfo=trigger.timezone))
+        self.assertEqual((next_run.year, next_run.month, next_run.day, next_run.hour), (2028, 2, 29, 9))
+        scheduler._build_trigger(Task(trigger_type="weekly", trigger_config={"weekdays": [0, 6], "hour": "9"}))
+
+    def test_impossible_yearly_date_is_isolated_at_startup(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        broken = Task(id="invalid-yearly", trigger_type="yearly", trigger_config={"month": 2, "day": 30})
+        healthy = Task(id="valid-weekly", trigger_type="weekly", trigger_config={"weekdays": [0], "hour": 9})
+        scheduler.sync_tasks([broken, healthy])
+        self.assertFalse(broken.enabled)
+        self.assertIsNone(scheduler._scheduler.get_job(broken.id))
+        self.assertIsNotNone(scheduler.task_next_run(healthy.id))
+
+    def test_editor_rejects_invalid_calendar_time_before_returning_task(self):
+        dialog = SimpleNamespace(
+            trigger_type_var=SimpleNamespace(get=lambda: "weekly"),
+            _collect_trigger_config=lambda _kind: {"weekdays": [0], "hour": 25},
+            body_text=None, title_var=SimpleNamespace(get=lambda: "有效标题"),
+            body_var=SimpleNamespace(get=lambda: ""), enabled_var=SimpleNamespace(get=lambda: True),
+            _task=None, result=None, destroy=MagicMock(),
+        )
+        with patch("gui.task_dialog.show_error") as error:
+            TaskDialog._save(dialog)
+        self.assertIsNone(dialog.result)
+        dialog.destroy.assert_not_called()
+        error.assert_called_once()
+
     def test_extreme_interval_is_disabled_without_interrupting_healthy_tasks(self):
         scheduler = TaskScheduler(MagicMock())
         scheduler.start()
