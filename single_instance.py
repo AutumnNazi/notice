@@ -59,6 +59,8 @@ PIPE_READMODE_MESSAGE = 0x00000002
 PIPE_WAIT = 0x00000000
 
 _SHOW_CALLBACK: Callable[[], None] | None = None
+_callback_lock = threading.Lock()
+_pending_wake = False
 _listener_ready = threading.Event()
 
 _mutex_handle = None
@@ -67,6 +69,7 @@ _listener_stop = threading.Event()
 
 # ── 主进程内管道监听（回退方案）────────────────────────────────────────
 def _listener_thread() -> None:
+    global _pending_wake
     while not _listener_stop.is_set():
         pipe = kernel32.CreateNamedPipeW(
             PIPE_NAME, PIPE_ACCESS_INBOUND,
@@ -86,8 +89,12 @@ def _listener_thread() -> None:
                 read = ctypes.wintypes.DWORD()
                 received = kernel32.ReadFile(pipe, buf, 64, ctypes.byref(read), None)
                 if received and buf.raw[:read.value] == b"WAKE" and not _listener_stop.is_set():
-                    if _SHOW_CALLBACK is not None:
-                        _SHOW_CALLBACK()
+                    with _callback_lock:
+                        callback = _SHOW_CALLBACK
+                        if callback is None:
+                            _pending_wake = True
+                    if callback is not None:
+                        callback()
         except Exception:
             _LOGGER.exception("处理唤醒请求失败")
         finally:
@@ -152,8 +159,14 @@ def single_instance_guard() -> None:
 
 
 def register_show_callback(callback: Callable[[], None]) -> None:
-    global _SHOW_CALLBACK
-    _SHOW_CALLBACK = callback
+    global _SHOW_CALLBACK, _pending_wake
+    # 初始化期间收到的唤醒合并成一次，窗口就绪后再执行，回调本身不占用锁。
+    with _callback_lock:
+        _SHOW_CALLBACK = callback
+        pending = _pending_wake
+        _pending_wake = False
+    if pending and not _listener_stop.is_set():
+        callback()
 
 
 def stop_helper() -> None:

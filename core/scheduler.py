@@ -31,12 +31,17 @@ class TaskScheduler:
         self._lock = RLock()
         self._tasks: dict[str, Task] = {}
         self._paused = False
+        self._stopping = False
 
     def start(self) -> None:
+        self._stopping = False
         if not self._scheduler.running:
             self._scheduler.start()
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._stopping = True
+        # 不持有任务锁等待调度器退出，避免与尚未结束的发送线程互相等待。
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
 
@@ -168,7 +173,7 @@ class TaskScheduler:
         """
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or not task.enabled or self._paused or (expected is not None and task is not expected):
+            if task is None or not task.enabled or self._paused or self._stopping or (expected is not None and task is not expected):
                 return None
         self.notifier.send(task)
         return task
@@ -181,14 +186,14 @@ class TaskScheduler:
         """
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or self._paused:
+            if task is None or self._paused or self._stopping:
                 return
         self.notifier.send(task)
 
     def _run_task(self, task_id: str) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or not task.enabled or self._paused:
+            if task is None or not task.enabled or self._paused or self._stopping:
                 return
         failure = None
         try:
@@ -199,7 +204,7 @@ class TaskScheduler:
             _LOGGER.error("提醒“%s”发送失败：%s", task.title, exc)
         with self._lock:
             # 发送期间用户可能已编辑或删除提醒，不覆盖新任务的状态与调度。
-            if self._tasks.get(task_id) is not task:
+            if self._stopping or self._tasks.get(task_id) is not task:
                 return
             if task.trigger_type == "once":
                 if failure is None:
@@ -229,7 +234,7 @@ class TaskScheduler:
         任务不存在时返回 False，让界面能如实说明「这条提醒已经不在了」。
         """
         with self._lock:
-            if task_id not in self._tasks:
+            if self._stopping or task_id not in self._tasks:
                 return False
             self._scheduler.add_job(
                 self._fire_snooze,
@@ -326,5 +331,5 @@ class TaskScheduler:
             task.next_run = None if self._paused else self.task_next_run(task_id)
 
     def _notify_changed(self) -> None:
-        if self.on_change:
+        if self.on_change and not self._stopping:
             self.on_change()

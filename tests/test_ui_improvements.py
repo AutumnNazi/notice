@@ -1112,6 +1112,99 @@ class CoreRegressionTests(unittest.TestCase):
                     thread.join(0.05)
                 self.assertFalse(thread.is_alive(), "测试监听线程必须退出")
 
+    def test_startup_wake_is_delivered_once_after_callback_registration(self):
+        import single_instance as instance
+        from uuid import uuid4
+
+        name = rf"\\.\pipe\NoticeStartupTest_{uuid4().hex}"
+        ready, stop = Event(), Event()
+        callback = MagicMock()
+        with patch.object(instance, "PIPE_NAME", name), patch.object(instance, "_listener_ready", ready), \
+             patch.object(instance, "_listener_stop", stop), patch.object(instance, "_SHOW_CALLBACK", None), \
+             patch.object(instance, "_pending_wake", False):
+            thread = threading.Thread(target=instance._listener_thread, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(ready.wait(3))
+                self.assertTrue(instance._send_direct())
+                # 再连上下一轮管道，证明上一条请求已被主监听读完，避免靠 sleep 猜处理时机。
+                self.assertTrue(instance.kernel32.WaitNamedPipeW(name, 3000))
+                instance.register_show_callback(callback)
+                callback.assert_called_once()
+                instance.register_show_callback(callback)
+                callback.assert_called_once()
+            finally:
+                stop.set()
+                deadline = time.monotonic() + 3
+                while thread.is_alive() and time.monotonic() < deadline:
+                    instance._send_direct()
+                    thread.join(0.05)
+                self.assertFalse(thread.is_alive())
+
+    def test_shutdown_during_send_does_not_rearm_or_refresh(self):
+        entered, release = Event(), Event()
+
+        def delayed_failure(_task):
+            entered.set()
+            self.assertTrue(release.wait(3))
+            raise OSError("退出期间发送失败")
+
+        changed = MagicMock()
+        scheduler = TaskScheduler(MagicMock(), on_change=changed)
+        scheduler.notifier.send.side_effect = delayed_failure
+        scheduler.start()
+        when = datetime.now() + timedelta(hours=1)
+        task = Task(id="shutdown-send", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(task)
+        changed.reset_mock()
+        errors = []
+
+        def worker():
+            try:
+                scheduler._run_task(task.id)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            scheduler.shutdown()
+        finally:
+            release.set()
+            thread.join(3)
+            if scheduler._scheduler.running:
+                scheduler._scheduler.shutdown(wait=True)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(scheduler._scheduler.get_jobs(), [])
+        changed.assert_not_called()
+
+    def test_stopped_scheduler_does_not_send_or_accept_snooze(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        when = datetime.now() + timedelta(hours=1)
+        task = Task(id="stopped", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(task)
+        scheduler.shutdown()
+        scheduler._run_task(task.id)
+        scheduler._fire_snooze(task.id)
+        scheduler.notifier.send.assert_not_called()
+        self.assertFalse(scheduler.snooze_task(task.id))
+
+    def test_stopped_listener_discards_pending_startup_wake(self):
+        import single_instance as instance
+
+        stop = Event()
+        stop.set()
+        callback = MagicMock()
+        with patch.object(instance, "_pending_wake", True), patch.object(instance, "_SHOW_CALLBACK", None), \
+             patch.object(instance, "_listener_stop", stop):
+            instance.register_show_callback(callback)
+            callback.assert_not_called()
+            self.assertFalse(instance._pending_wake)
+
     def test_wake_cli_returns_failure_exit_code(self):
         import wake
 
