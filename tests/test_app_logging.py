@@ -113,6 +113,22 @@ class AppLoggingTests(unittest.TestCase):
         lines = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8").splitlines()
         self.assertEqual(len([line for line in lines if "同一条失败只应写一次" in line]), 1)
 
+    def test_reused_file_handler_applies_updated_log_level(self):
+        root = app_logging.setup_logging(self.log_dir, level=logging.WARNING)
+        handler = next(item for item in root.handlers if item.get_name() == app_logging.FILE_HANDLER_NAME)
+        updated = app_logging.setup_logging(self.log_dir, level=logging.DEBUG)
+        self.assertIs(updated, root)
+        self.assertEqual(root.level, logging.DEBUG)
+        self.assertIs(next(item for item in root.handlers if item.get_name() == app_logging.FILE_HANDLER_NAME), handler)
+        app_logging.get_logger("level-test").debug("开启调试记录")
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertEqual(content.count("开启调试记录"), 1)
+        app_logging.setup_logging(self.log_dir, level=logging.ERROR)
+        app_logging.get_logger("level-test").warning("恢复高级别后忽略")
+        content = (self.log_dir / app_logging.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertNotIn("恢复高级别后忽略", content)
+        self.assertEqual(len([item for item in root.handlers if item.get_name() == app_logging.FILE_HANDLER_NAME]), 1)
+
     def test_default_dir_comes_from_config_at_call_time(self):
         with patch.object(config, "LOG_DIR", self.log_dir):
             app_logging.setup_logging()

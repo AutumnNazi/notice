@@ -71,6 +71,7 @@ def setup_logging(log_dir: Path | str | None = None, level: int = logging.INFO) 
     target = Path(log_dir) if log_dir is not None else Path(config.LOG_DIR)
     if target == _installed_log_dir and any(
             handler.get_name() == FILE_HANDLER_NAME for handler in root.handlers):
+        root.setLevel(level)
         return root
 
     _remove_own_handlers(root)
