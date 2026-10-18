@@ -31,6 +31,19 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _validate_json_text(data: object) -> None:
+    pending = [data]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            value.encode("utf-8")
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
 class TaskStore:
     def __init__(self, path: Path = TASKS_FILE) -> None:
         self.path = path
@@ -112,6 +125,8 @@ class TaskStore:
             with path.open("r", encoding="utf-8-sig") as handle:
                 data = json.load(handle, parse_float=_finite_json_number, parse_constant=_finite_json_number,
                                  object_pairs_hook=_unique_json_object)
+            # JSON 允许转义孤立代理字符，但它无法用 UTF-8 写回；读取边界先拒绝并留档。
+            _validate_json_text(data)
         except UnicodeDecodeError as error:
             self._quarantine(path, label, f"UTF-8 解码失败：{error}")
             return None

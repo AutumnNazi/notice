@@ -105,6 +105,31 @@ class TaskFileCorruptionTests(unittest.TestCase):
         self.assertEqual(tasks, [])
         self.assert_quarantined(path, raw, diagnostics, "UTF-8")
 
+    def test_escaped_unpaired_surrogates_are_archived_before_later_save(self):
+        cases = [b'{"tasks":[{"id":"surrogate","title":"bad\\ud800","trigger_type":"interval",'
+                 b'"trigger_config":{"minutes":1}}]}',
+                 b'{"tasks":[],"extra":[["\\udfff"]]}',
+                 b'{"tasks":[],"\\ud800":"invalid key"}']
+        for raw in cases:
+            with self.subTest(raw=raw):
+                path, tasks, diagnostics = self.load(raw)
+                self.assertEqual(tasks, [])
+                self.assert_quarantined(path, raw, diagnostics, "JSON")
+                TaskStore(path).save_tasks(tasks)
+
+    def test_valid_chinese_and_surrogate_pairs_roundtrip_without_backup(self):
+        raw = (b'{"tasks":[{"id":"unicode-valid","title":"\\u4e2d\\u6587\\ud83d\\ude80",'
+               b'"body":"\\u00e9","trigger_type":"interval","trigger_config":{"minutes":1}}]}')
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            path.write_bytes(raw)
+            store = TaskStore(path)
+            tasks = store.load_tasks()
+            self.assertEqual(tasks[0].title, "\u4e2d\u6587\U0001f680")
+            store.save_tasks(tasks)
+            self.assertEqual(store.load_tasks()[0].title, tasks[0].title)
+            self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+
     def test_unsupported_json_numbers_are_quarantined_and_safe_to_save(self):
         for value in ("NaN", "Infinity", "-Infinity", "1e999", "9" * 5000):
             with self.subTest(value=value[:20]):
@@ -376,6 +401,7 @@ class SettingsFileCorruptionTests(unittest.TestCase):
         cases = {
             "非法 JSON": b'{"font_family": ',
             "非法 UTF-8": b'{"font_family": "\xff"}',
+            "孤立代理字符": b'{"font_family":"\\ud800"}',
             "重复关闭选项": b'{"close_action":"tray","close_action":"exit"}',
             "顶层是数组": b'["font_family"]',
             "顶层是字符串": b'"font_family"',
