@@ -69,8 +69,12 @@ class TaskDialog(tk.Toplevel):
         self.yearly_minute_var = tk.StringVar(value=str(self._cfg("minute", 0)))
         self.yearly_second_var = tk.StringVar(value=str(self._cfg("second", 0)))
         self.cron_var = tk.StringVar(value=self._cfg("expression", "0 9 * * 1-5"))
+        # 脏星期字段仍要能打开编辑器；只展示合法索引，不改写任务原始配置。
+        configured_weekdays = self._cfg("weekdays", [0])
+        weekdays = {day for day in configured_weekdays if type(day) is int and 0 <= day <= 6} \
+            if isinstance(configured_weekdays, list) else set()
         self.weekday_vars = {
-            value: tk.BooleanVar(value=value in self._cfg("weekdays", [0]))
+            value: tk.BooleanVar(value=value in weekdays)
             for _, value in WEEKDAY_LABELS
         }
         self.enabled_indicator: tk.Label | None = None
@@ -357,7 +361,7 @@ class TaskDialog(tk.Toplevel):
     def _collect_trigger_config(self, trigger_type: str) -> dict[str, object]:
         if trigger_type == "once":
             run_at = datetime.fromisoformat(f"{self.once_date_var.get()}T{self.once_time_var.get()}")
-            if run_at <= datetime.now():
+            if run_at <= datetime.now(run_at.tzinfo):
                 raise ValueError("单次提醒时间必须晚于当前时间。")
             return {"date": self.once_date_var.get(), "time": self.once_time_var.get()}
         if trigger_type == "interval":

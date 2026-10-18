@@ -999,6 +999,53 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_malformed_weekdays_can_be_opened_and_repaired_in_editor(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        for value in (None, 7, "10", [True, 8, "1"]):
+            with self.subTest(value=value):
+                config = {"weekdays": value, "hour": 9}
+                task = Task(trigger_type="weekly", trigger_config=config, enabled=False)
+                dialog = TaskDialog(root, task=task)
+                try:
+                    self.assertFalse(any(var.get() for var in dialog.weekday_vars.values()))
+                    self.assertEqual(task.trigger_config, config)
+                    dialog.weekday_vars[0].set(True)
+                    self.assertEqual(dialog._collect_trigger_config("weekly"),
+                                     {"weekdays": [0], "hour": 9, "minute": 0, "second": 0})
+                finally:
+                    dialog.destroy()
+
+    def test_once_editor_accepts_future_time_with_explicit_offset(self):
+        when = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)
+        dialog = TaskDialog.__new__(TaskDialog)
+        dialog.once_date_var = SimpleNamespace(get=lambda: when.date().isoformat())
+        dialog.once_time_var = SimpleNamespace(get=lambda: when.timetz().isoformat())
+        self.assertEqual(dialog._collect_trigger_config("once"),
+                         {"date": when.date().isoformat(), "time": when.timetz().isoformat()})
+
+    def test_once_editor_rejects_past_time_with_explicit_offset(self):
+        when = datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)
+        dialog = TaskDialog.__new__(TaskDialog)
+        dialog.once_date_var = SimpleNamespace(get=lambda: when.date().isoformat())
+        dialog.once_time_var = SimpleNamespace(get=lambda: when.timetz().isoformat())
+        with self.assertRaisesRegex(ValueError, "晚于当前时间"):
+            dialog._collect_trigger_config("once")
+
+    def test_editor_keeps_valid_weekdays_from_mixed_corrupt_array(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        config = {"weekdays": [0, True, 6, -1, "2"], "hour": 9}
+        task = Task(trigger_type="weekly", trigger_config=config, enabled=False)
+        dialog = TaskDialog(root, task=task)
+        try:
+            self.assertEqual([day for day, var in dialog.weekday_vars.items() if var.get()], [0, 6])
+            self.assertEqual(task.trigger_config, config)
+        finally:
+            dialog.destroy()
+
     def test_calendar_configs_reject_impossible_dates_and_ambiguous_numbers(self):
         scheduler = TaskScheduler(MagicMock())
         cases = [("yearly", {"month": 2, "day": 30}),
