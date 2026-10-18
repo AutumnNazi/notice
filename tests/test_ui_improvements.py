@@ -999,6 +999,81 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_repeated_icon_generation_reuses_assets_and_repairs_missing_files(self):
+        import core.icon_assets as assets
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            sizes = (16, 32, 256)
+            pngs = tuple(root / f"icon-{size}.png" for size in sizes)
+            with patch.multiple(assets, ICON_FILE=root / "tray.png", TOAST_IMAGE_FILE=root / "toast.png",
+                                ICON_ICO_FILE=root / "app.ico", ICON_PNG_FILES=pngs, ICON_PNG_SIZES=sizes):
+                assets.ensure_icon_assets()
+                with patch.object(assets, "_build_leaf_icon", wraps=assets._build_leaf_icon) as render:
+                    assets.ensure_icon_assets()
+                    render.assert_not_called()
+                    pngs[0].unlink()
+                    assets.ensure_icon_assets()
+                    self.assertTrue(pngs[0].is_file())
+                    self.assertGreater(render.call_count, 0)
+
+    def test_tray_icon_load_does_not_retain_file_handle(self):
+        import gui.tray as tray_module
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tray.png"
+            with Image.new("RGBA", (16, 16), "red") as source:
+                source.save(path)
+            controller = tray_module.TrayController.__new__(tray_module.TrayController)
+            with patch.object(tray_module, "ICON_FILE", path), patch.object(tray_module, "ensure_icon_assets"):
+                image = controller._load_icon()
+            try:
+                self.assertIsNone(getattr(image, "fp", None))
+                self.assertEqual(image.getpixel((0, 0)), (255, 0, 0, 255))
+            finally:
+                image.close()
+
+    def test_concurrent_icon_initialization_generates_one_complete_set(self):
+        import core.icon_assets as assets
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.multiple(assets, ICON_FILE=root / "tray.png", TOAST_IMAGE_FILE=root / "toast.png",
+                                ICON_ICO_FILE=root / "app.ico", ICON_PNG_FILES=(root / "small.png",), ICON_PNG_SIZES=(16,)), \
+                 patch.object(assets, "_build_leaf_icon", wraps=assets._build_leaf_icon) as render:
+                errors = []
+
+                def initialize():
+                    try:
+                        assets.ensure_icon_assets()
+                    except Exception as exc:
+                        errors.append(exc)
+
+                workers = [threading.Thread(target=initialize) for _ in range(3)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(3)
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+                self.assertEqual(errors, [])
+                self.assertEqual(render.call_count, 3)
+
+    def test_failed_icon_write_is_retried_instead_of_marked_complete(self):
+        import core.icon_assets as assets
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.multiple(assets, ICON_FILE=root / "tray.png", TOAST_IMAGE_FILE=root / "toast.png",
+                                ICON_ICO_FILE=root / "app.ico", ICON_PNG_FILES=(root / "small.png",), ICON_PNG_SIZES=(16,)):
+                with patch.object(Image.Image, "save", side_effect=OSError("磁盘已满")):
+                    with self.assertRaises(OSError):
+                        assets.ensure_icon_assets()
+                assets.ensure_icon_assets()
+                self.assertTrue(all(path.is_file() for path in root.iterdir()))
+                self.assertEqual(len(list(root.iterdir())), 4)
+
     def test_dpi_setup_uses_api_results_to_choose_fallback(self):
         import ctypes
 

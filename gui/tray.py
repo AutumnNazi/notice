@@ -6,7 +6,7 @@ from typing import Callable
 
 from PIL import Image
 
-from config import APP_NAME, ICON_FILE, ICON_ICO_FILE, TOAST_IMAGE_FILE
+from config import APP_NAME, ICON_FILE
 from core.icon_assets import ensure_icon_assets
 
 try:
@@ -68,4 +68,5 @@ class TrayController:
 
     def _load_icon(self):
         ensure_icon_assets()
-        return Image.open(Path(ICON_FILE))
+        with Image.open(Path(ICON_FILE)) as image:
+            return image.copy()

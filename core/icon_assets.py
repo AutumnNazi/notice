@@ -1,24 +1,38 @@
 from __future__ import annotations
 
+from threading import Lock
+
 from PIL import Image, ImageDraw
 
 from config import ICON_FILE, ICON_ICO_FILE, ICON_PNG_FILES, ICON_PNG_SIZES, TOAST_IMAGE_FILE
 
+_ICON_LOCK = Lock()
+_generated_assets = None
+
 
 def ensure_icon_assets() -> None:
-    ICON_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tray_image = _build_leaf_icon(256)
-    toast_image = _build_leaf_icon(256)
-    icon_images = [_build_leaf_icon(size) for size in ICON_PNG_SIZES]
-
-    tray_image.save(ICON_FILE)
-    toast_image.save(TOAST_IMAGE_FILE)
-    for icon_file, icon_image in zip(ICON_PNG_FILES, icon_images):
-        icon_image.save(icon_file)
-    toast_image.save(
-        ICON_ICO_FILE,
-        sizes=[(size, size) for size in ICON_PNG_SIZES],
-    )
+    global _generated_assets
+    files = (ICON_FILE, TOAST_IMAGE_FILE, ICON_ICO_FILE, *ICON_PNG_FILES)
+    key = (files, ICON_PNG_SIZES)
+    with _ICON_LOCK:
+        # 每次新进程首次运行仍刷新图标；同进程多处初始化不重复绘制，缺失时补齐。
+        if _generated_assets == key and all(path.is_file() for path in files):
+            return
+        _generated_assets = None
+        ICON_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tray_image = _build_leaf_icon(256)
+        toast_image = _build_leaf_icon(256)
+        icon_images = [_build_leaf_icon(size) for size in ICON_PNG_SIZES]
+        try:
+            tray_image.save(ICON_FILE)
+            toast_image.save(TOAST_IMAGE_FILE)
+            for icon_file, icon_image in zip(ICON_PNG_FILES, icon_images):
+                icon_image.save(icon_file)
+            toast_image.save(ICON_ICO_FILE, sizes=[(size, size) for size in ICON_PNG_SIZES])
+            _generated_assets = key
+        finally:
+            for image in (tray_image, toast_image, *icon_images):
+                image.close()
 
 
 def _build_leaf_icon(size: int) -> Image.Image:
