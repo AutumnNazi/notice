@@ -1170,6 +1170,69 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_notification_script_rejects_system_blocks_before_show(self):
+        import base64
+
+        notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+        with patch.object(notifier, "_ensure_start_menu_shortcut"), \
+             patch.object(notifier_module.subprocess, "run") as run:
+            notifier.send(Task(title="系统通知状态测试"))
+        script = base64.b64decode(run.call_args.args[0][-1]).decode("utf-16-le")
+        self.assertIn("$notifier.Setting", script)
+        self.assertLess(script.index("$notifier.Setting"), script.index("$notifier.Show"))
+        # 替换唯一的通知发送对象，XML 与 PowerShell 校验仍走真实系统实现，不显示通知。
+        factory_line = next(line for line in script.splitlines() if "$notifier =" in line)
+        for setting in range(5):
+            with self.subTest(setting=setting):
+                fake = (f"$notifier = [pscustomobject]@{{Setting={setting}}}; "
+                        "$notifier | Add-Member -MemberType ScriptMethod -Name Show "
+                        "-Value { param($toast) Write-Output 'SAFE_SHOW' };")
+                safe = script.replace(factory_line, fake)
+                command = base64.b64encode(safe.encode("utf-16-le")).decode("ascii")
+                result = subprocess.run(
+                    [str(notifier_module.POWERSHELL), "-NoProfile", "-NonInteractive", "-EncodedCommand", command],
+                    input=run.call_args.kwargs["input"], capture_output=True, encoding="utf-8", timeout=15,
+                )
+                if setting == 0:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("SAFE_SHOW", result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("SAFE_SHOW", result.stdout)
+
+    def test_system_block_keeps_once_reminder_for_retry_until_notifications_are_allowed(self):
+        import base64
+
+        notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+        scheduler = TaskScheduler(notifier)
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        when = datetime.now() + timedelta(hours=1)
+        task = Task(id="system-blocked-once", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(task)
+        setting = 1
+        system_run = subprocess.run
+
+        def simulated_system(command, **kwargs):
+            script = base64.b64decode(command[-1]).decode("utf-16-le")
+            factory = next(line for line in script.splitlines() if "$notifier =" in line)
+            fake = (f"$notifier = [pscustomobject]@{{Setting={setting}}}; "
+                    "$notifier | Add-Member -MemberType ScriptMethod -Name Show -Value { param($toast) };")
+            safe_command = command[:-1] + [base64.b64encode(script.replace(factory, fake).encode("utf-16-le")).decode("ascii")]
+            return system_run(safe_command, **kwargs)
+
+        with patch.object(notifier, "_ensure_start_menu_shortcut"), \
+             patch.object(notifier_module.subprocess, "run", side_effect=simulated_system):
+            with self.assertRaises(subprocess.CalledProcessError):
+                scheduler._run_task(task.id)
+            self.assertTrue(task.enabled)
+            self.assertIsNotNone(scheduler.task_next_run(task.id))
+            setting = 0
+            scheduler._run_task(task.id)
+        self.assertFalse(task.enabled)
+        self.assertIsNone(task.next_run)
+
     def test_notification_text_rejects_xml_controls_but_keeps_valid_unicode(self):
         for field in ("title", "body"):
             for value in ("内容\x00", "内容\x01", "内容\ufffe", "内容\ud800"):

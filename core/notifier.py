@@ -52,7 +52,9 @@ $xml = [Windows.Data.Xml.Dom.XmlDocument]::new();
 $xml.LoadXml([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())));
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml);
 $toast.Tag = '{tag}';
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast);
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}');
+if ([int]$notifier.Setting -ne 0) {{ throw ('Windows notification blocked: ' + $notifier.Setting) }};
+$notifier.Show($toast);
 """
             encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
             subprocess.run(
