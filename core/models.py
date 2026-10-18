@@ -159,3 +159,4 @@ class Task:
             self.priority = "normal"
         if self.trigger_type == "interval":
             validate_interval_config(self.trigger_config)
+        validate_calendar_config(self.trigger_type, self.trigger_config)

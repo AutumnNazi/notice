@@ -7,7 +7,7 @@ from tkinter import ttk
 from apscheduler.triggers.cron import CronTrigger
 
 from config import TRIGGER_TYPES, WEEKDAY_LABELS
-from core.models import Task, validate_calendar_config, validate_interval_config
+from core.models import Task, validate_interval_config
 from gui.message_dialog import show_error
 from gui.theme import (
     PALETTE,
@@ -350,7 +350,6 @@ class TaskDialog(tk.Toplevel):
                 next_run=self._task.next_run if self._task else None,
             )
             task.validate()
-            validate_calendar_config(task.trigger_type, task.trigger_config)
         except Exception as exc:
             show_error(self, "保存失败", str(exc))
             return

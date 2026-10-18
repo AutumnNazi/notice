@@ -140,6 +140,53 @@ class TaskFileCorruptionTests(unittest.TestCase):
         self.assertFalse(tasks[0].sound)
         self.assertIn("sound", diagnostics)
 
+    def test_invalid_calendar_records_are_archived_before_scheduler_changes(self):
+        cases = [("yearly", {"month": 2, "day": 30}),
+                 ("weekly", {"weekdays": "10", "hour": 9}),
+                 ("weekly_last_workday", {"hour": 25})]
+        for kind, config in cases:
+            with self.subTest(kind=kind):
+                record = {"id": "calendar-load", "trigger_type": kind, "trigger_config": config, "enabled": True}
+                raw = json.dumps({"tasks": [record]}).encode("utf-8")
+                path, tasks, diagnostics = self.load(raw)
+                self.assertFalse(tasks[0].enabled)
+                self.assertEqual(tasks[0].trigger_config, config)
+                self.assertIsNotNone(tasks[0].load_warning)
+                self.assertIn("calendar-load", diagnostics)
+                self.assertEqual([p.read_bytes() for p in path.parent.glob("tasks.json.corrupt-*")], [raw])
+                with self.assertRaises(ValueError):
+                    Task.from_dict(record)
+
+    def test_valid_calendar_records_keep_enabled_state_and_do_not_create_backup(self):
+        cases = [("yearly", {"month": "2", "day": "29", "hour": "9"}),
+                 ("weekly", {"weekdays": [0, 6], "hour": 9}),
+                 ("weekly_last_workday", {"hour": 18})]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            records = [{"id": kind, "trigger_type": kind, "trigger_config": config, "enabled": True}
+                       for kind, config in cases]
+            path.write_text(json.dumps({"tasks": records}), encoding="utf-8")
+            tasks = TaskStore(path).load_tasks()
+            self.assertTrue(all(task.enabled and task.load_warning is None for task in tasks))
+            self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+
+    def test_repaired_calendar_record_can_be_enabled_and_saved_with_original_backup(self):
+        record = {"id": "calendar-repair", "title": "生日", "trigger_type": "yearly",
+                  "trigger_config": {"month": 2, "day": 30}, "enabled": True}
+        raw = json.dumps({"tasks": [record]}, ensure_ascii=False).encode("utf-8")
+        path, tasks, _diagnostics = self.load(raw)
+        task = tasks[0]
+        task.trigger_config = {"month": 2, "day": 29, "hour": 9}
+        task.enabled = True
+        task.validate()
+        store = TaskStore(path)
+        store.save_tasks(tasks)
+        loaded = store.load_tasks()[0]
+        self.assertTrue(loaded.enabled)
+        self.assertIsNone(loaded.load_warning)
+        self.assertEqual(loaded.trigger_config, task.trigger_config)
+        self.assertEqual([p.read_bytes() for p in path.parent.glob("tasks.json.corrupt-*")], [raw])
+
     def test_non_object_top_level_returns_empty_list(self):
         raw = b'[{"id": "1"}]'
         path, tasks, stderr = self.load(raw)
