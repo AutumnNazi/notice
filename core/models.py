@@ -12,10 +12,15 @@ TRIGGER_TYPE_VALUES = {"once", "interval", "weekly", "weekly_last_workday", "yea
 
 
 def validate_interval_config(config: dict[str, Any]) -> dict[str, int]:
-    try:
-        values = {key: int(config.get(key, 0)) for key in ("weeks", "days", "hours", "minutes", "seconds")}
-    except OverflowError as exc:
-        raise ValueError("循环间隔数值超出有效范围。") from exc
+    values: dict[str, int] = {}
+    for key in ("weeks", "days", "hours", "minutes", "seconds"):
+        raw = config.get(key, 0)
+        if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+            raise ValueError("循环间隔必须使用整数，不能使用布尔值或小数。")
+        try:
+            values[key] = int(raw)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError("循环间隔必须是有效整数。") from exc
     if any(value < 0 for value in values.values()):
         raise ValueError("循环间隔不能为负数。")
     if not any(values.values()):

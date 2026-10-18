@@ -1487,6 +1487,27 @@ class CoreRegressionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     TaskScheduler(MagicMock())._build_trigger(task)
 
+    def test_interval_rejects_fractional_numbers_and_boolean_values(self):
+        for config in ({"hours": 1, "minutes": -0.5}, {"minutes": 1.9}, {"seconds": True}):
+            with self.subTest(config=config):
+                task = Task(trigger_type="interval", trigger_config=config)
+                with self.assertRaises(ValueError):
+                    task.validate()
+                with self.assertRaises(ValueError):
+                    TaskScheduler(MagicMock())._build_trigger(task)
+                loaded = Task.from_dict(task.to_dict(), strict=False)
+                self.assertFalse(loaded.enabled)
+                self.assertEqual(loaded.trigger_config, config)
+                self.assertIsNotNone(loaded.load_warning)
+
+    def test_interval_keeps_integer_and_integer_string_compatibility(self):
+        for value in (2, "2", 2.0):
+            with self.subTest(value=value):
+                task = Task(trigger_type="interval", trigger_config={"minutes": value})
+                task.validate()
+                trigger = TaskScheduler(MagicMock())._build_trigger(task)
+                self.assertEqual(trigger.interval, timedelta(minutes=2))
+
     def test_notification_sends_from_real_scheduler_worker(self):
         with TemporaryDirectory() as directory:
             notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
