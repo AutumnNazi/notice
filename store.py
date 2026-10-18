@@ -48,10 +48,12 @@ class TaskStore:
     def __init__(self, path: Path = TASKS_FILE) -> None:
         self.path = path
         self._unprotected_paths: set[Path] = set()
+        self._unread_paths: set[Path] = set()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     def load_tasks(self) -> list[Task]:
         if not self.path.exists():
+            self._unread_paths.discard(self.path)
             return []
         data = self._read_json(self.path, "提醒数据")
         if data is None:
@@ -106,6 +108,7 @@ class TaskStore:
 
     def load_settings(self, path: Path = SETTINGS_FILE) -> dict[str, object]:
         if not path.exists():
+            self._unread_paths.discard(path)
             return SETTINGS_DEFAULTS.copy()
         data = self._read_json(path, "提醒设置")
         if data is None:
@@ -128,16 +131,19 @@ class TaskStore:
             # JSON 允许转义孤立代理字符，但它无法用 UTF-8 写回；读取边界先拒绝并留档。
             _validate_json_text(data)
         except UnicodeDecodeError as error:
+            self._unread_paths.discard(path)
             self._quarantine(path, label, f"UTF-8 解码失败：{error}")
             return None
         except ValueError as error:
+            self._unread_paths.discard(path)
             self._quarantine(path, label, f"JSON 解析失败：{error}")
             return None
         except OSError as error:
             # 文件被占用或权限不足时连备份都读不出来，这里只提示、不改动也无法改动原文件。
             _LOGGER.warning("[%s] 读取 %s 失败，本次已改用安全默认值：%s", label, path, error)
-            self._unprotected_paths.add(path)
+            self._unread_paths.add(path)
             return None
+        self._unread_paths.discard(path)
         if not isinstance(data, dict):
             self._quarantine(path, label, f"顶层应为 JSON 对象，实际是 {type(data).__name__}")
             return None
@@ -195,6 +201,9 @@ class TaskStore:
         return True
 
     def _save_json(self, path: Path, payload: dict) -> None:
+        # 临时读取失败不代表内容损坏，空回退值不能覆盖尚未读过的合法提醒或设置。
+        if path in self._unread_paths:
+            raise OSError(f"原文件尚未成功读取，请解除占用后重新读取或重启程序：{path}")
         # 完整写入并落盘后才替换原文件；失败时旧提醒和设置仍然可读。
         text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
         path.parent.mkdir(parents=True, exist_ok=True)

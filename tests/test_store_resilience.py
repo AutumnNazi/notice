@@ -76,6 +76,25 @@ class TaskFileCorruptionTests(unittest.TestCase):
         self.assertEqual(tasks, [])
         self.assert_quarantined(path, raw, stderr, "JSON")
 
+    def test_temporary_read_failure_cannot_overwrite_valid_reminders_with_fallback(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            store = TaskStore(path)
+            store.save_tasks([Task(id="keep-original", title="原提醒", trigger_type="interval",
+                                   trigger_config={"minutes": 5})])
+            original = path.read_bytes()
+            with hold_exclusive(path), self.assertLogs("store", level="WARNING"):
+                fallback = store.load_tasks()
+            self.assertEqual(fallback, [])
+            with self.assertRaisesRegex(OSError, "重新读取"):
+                store.save_tasks(fallback)
+            self.assertEqual(path.read_bytes(), original)
+            restored = store.load_tasks()
+            self.assertEqual([task.id for task in restored], ["keep-original"])
+            store.save_tasks(restored)
+            self.assertEqual(store.load_tasks()[0].trigger_config, {"minutes": 5})
+            self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+
     def test_duplicate_json_keys_are_archived_instead_of_overriding_task_rules(self):
         raw = (b'{"tasks":[{"id":"duplicate-key","trigger_type":"interval",'
                b'"trigger_config":{"minutes":5,"minutes":1},"enabled":false,"enabled":true}]}')
@@ -440,6 +459,41 @@ class SettingsFileCorruptionTests(unittest.TestCase):
                 stderr_text = "\n".join(diagnostics.output)
                 self.assertIn(str(path), stderr_text)
                 self.assertIn(backups[0].name, stderr_text)
+
+    def test_temporary_settings_read_failure_requires_successful_reload_before_save(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = TaskStore(path)
+            settings = SETTINGS_DEFAULTS | {"font_family": "原字体", "close_action": "tray"}
+            store.save_settings(settings, path)
+            original = path.read_bytes()
+            for _ in range(2):
+                with hold_exclusive(path), self.assertLogs("store", level="WARNING"):
+                    fallback = store.load_settings(path)
+                self.assertEqual(fallback, SETTINGS_DEFAULTS)
+                with self.assertRaisesRegex(OSError, "重新读取"):
+                    store.save_settings(fallback, path)
+                self.assertEqual(path.read_bytes(), original)
+            loaded = store.load_settings(path)
+            self.assertEqual(loaded, settings)
+            store.save_settings(loaded, path)
+            self.assertEqual(store.load_settings(path), settings)
+            self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+
+    def test_reload_detects_real_corruption_after_temporary_read_failure(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = TaskStore(path)
+            store.save_settings(SETTINGS_DEFAULTS, path)
+            with hold_exclusive(path), self.assertLogs("store", level="WARNING"):
+                store.load_settings(path)
+            raw = b'{"font_family": '
+            path.write_bytes(raw)
+            with self.assertLogs("store", level="WARNING"):
+                fallback = store.load_settings(path)
+            store.save_settings(fallback, path)
+            self.assertEqual(store.load_settings(path), SETTINGS_DEFAULTS)
+            self.assertEqual([p.read_bytes() for p in path.parent.glob("*.corrupt-*")], [raw])
 
     def test_failed_settings_backup_blocks_default_save_until_protected(self):
         with TemporaryDirectory() as directory:
