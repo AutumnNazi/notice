@@ -1821,6 +1821,13 @@ class NoticeApp:
         self.root.after(120, self.open_settings)
 
     def exit_app(self) -> None:
+        # 保存失败时保留时钟、托盘和调度，用户可释放磁盘空间后重新退出。
+        try:
+            self._persist_tasks()
+        except Exception as exc:
+            logging.getLogger(__name__).error("退出前保存提醒失败：%s", exc, exc_info=True)
+            show_error(self.root, "退出失败", f"提醒保存失败，程序仍继续运行。请处理后重试：{exc}")
+            return
         if self._clock_after_id is not None:
             self.root.after_cancel(self._clock_after_id)
             self._clock_after_id = None
@@ -1830,7 +1837,6 @@ class NoticeApp:
         self.tray.stop()
         stop_helper()
         self.scheduler.shutdown()
-        self._persist_tasks()
         self.root.after(0, self.root.destroy)
 
     def request_exit_app(self) -> None:

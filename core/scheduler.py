@@ -20,6 +20,7 @@ _LOGGER = get_logger(__name__)
 # 稍后提醒用的独立 job 前缀：补发的这一次通知不能占用提醒自己的调度槽位。
 SNOOZE_JOB_PREFIX = "snooze:"
 DEFAULT_SNOOZE_MINUTES = 10
+NOTIFICATION_RETRY_SECONDS = 60
 
 
 class TaskScheduler:
@@ -158,7 +159,7 @@ class TaskScheduler:
         )
         task.next_run = self.task_next_run(task.id)
 
-    def _notify(self, task_id: str) -> Task | None:
+    def _notify(self, task_id: str, *, expected: Task | None = None) -> Task | None:
         """定时触发路径：停用中的提醒不发通知，返回实际通知的任务。
 
         只读任务、不推进任何调度状态，所以 _run_task 可以据此把「发通知」和
@@ -166,7 +167,7 @@ class TaskScheduler:
         """
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or not task.enabled or self._paused:
+            if task is None or not task.enabled or self._paused or (expected is not None and task is not expected):
                 return None
         self.notifier.send(task)
         return task
@@ -184,21 +185,39 @@ class TaskScheduler:
         self.notifier.send(task)
 
     def _run_task(self, task_id: str) -> None:
-        task = self._notify(task_id)
-        if task is None:
-            return
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or not task.enabled or self._paused:
+                return
+        failure = None
+        try:
+            if self._notify(task_id, expected=task) is None:
+                return
+        except Exception as exc:
+            failure = exc
+            _LOGGER.error("提醒“%s”发送失败：%s", task.title, exc)
         with self._lock:
             # 发送期间用户可能已编辑或删除提醒，不覆盖新任务的状态与调度。
             if self._tasks.get(task_id) is not task:
                 return
             if task.trigger_type == "once":
-                task.enabled = False
-                task.next_run = None
+                if failure is None:
+                    task.enabled = False
+                    task.next_run = None
+                else:
+                    # 单次 job 已被调度器取走；临时发送失败要重试，不能假装已提醒并停用。
+                    self._scheduler.add_job(
+                        self._run_task, DateTrigger(run_date=datetime.now() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)),
+                        id=task.id, args=[task.id], replace_existing=True, misfire_grace_time=30,
+                    )
+                    task.next_run = self.task_next_run(task.id)
             elif task.trigger_type == "weekly_last_workday" and task.enabled:
                 self._schedule_task(task)
             else:
                 task.next_run = None if self._paused else self.task_next_run(task_id)
         self._notify_changed()
+        if failure is not None:
+            raise failure
 
     def _snooze_job_id(self, task_id: str) -> str:
         return f"{SNOOZE_JOB_PREFIX}{task_id}"

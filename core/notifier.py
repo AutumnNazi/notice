@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import os
 import subprocess
 import sys
 from pathlib import Path
+from xml.etree.ElementTree import Element, SubElement, tostring
 
 import pythoncom
 from win32com.client import Dispatch
@@ -10,12 +13,12 @@ from win32com.propsys import propsys, pscon
 
 from config import APP_ID, APP_NAME, ICON_ICO_FILE, SHORTCUT_FILE, START_MENU_DIR, TOAST_IMAGE_FILE
 from core.icon_assets import ensure_icon_assets
+from core.app_logging import get_logger
 from core.models import Task
 
-try:
-    from winotify import Notification
-except ImportError:  # pragma: no cover - depends on local environment
-    Notification = None
+_LOGGER = get_logger(__name__)
+POWERSHELL = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+NOTIFICATION_TIMEOUT_SECONDS = 15
 
 
 class Notifier:
@@ -24,21 +27,41 @@ class Notifier:
         self._ensure_start_menu_shortcut()
 
     def send(self, task: Task) -> None:
-        if Notification is None:
-            return
-
         # 调度器使用工作线程，COM 必须在实际调用线程初始化并配对释放。
         pythoncom.CoInitialize()
         try:
             self._ensure_start_menu_shortcut()
-            toast = Notification(
-                app_id=APP_ID,
-                title=task.title,
-                msg=task.body or APP_NAME,
-                icon=self._toast_image(),
-                duration="long" if task.priority == "high" else "short",
+            toast = Element("toast", duration="long" if task.priority == "high" else "short")
+            binding = SubElement(SubElement(toast, "visual"), "binding", template="ToastImageAndText02")
+            SubElement(binding, "image", id="1", src=self._toast_image())
+            SubElement(binding, "text", id="1").text = task.title
+            SubElement(binding, "text", id="2").text = task.body or APP_NAME
+            SubElement(toast, "audio", silent="true")
+            # XML 编码后只作为数据解码；标题、正文和路径不能参与 PowerShell 语法解析。
+            xml_data = base64.b64encode(tostring(toast, encoding="utf-8")).decode("ascii")
+            app_id = APP_ID.replace("'", "''")
+            tag = task.id[:16].replace("'", "''")
+            script = f"""
+$ErrorActionPreference = 'Stop';
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;
+[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null;
+$xml = [Windows.Data.Xml.Dom.XmlDocument]::new();
+$xml.LoadXml([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{xml_data}')));
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml);
+$toast.Tag = '{tag}';
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast);
+"""
+            encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+            subprocess.run(
+                [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                check=True, capture_output=True, encoding="utf-8", errors="replace",
+                timeout=NOTIFICATION_TIMEOUT_SECONDS, creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            toast.show()
+        except (OSError, subprocess.SubprocessError) as exc:
+            _LOGGER.error("提醒 %s 发送失败：%s；系统输出=%s", task.id, exc, getattr(exc, "stderr", ""))
+            raise
         finally:
             pythoncom.CoUninitialize()
 

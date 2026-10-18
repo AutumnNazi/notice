@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import queue
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -973,6 +974,161 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_notification_text_is_data_and_child_failure_is_reported(self):
+        import base64
+        import xml.etree.ElementTree as ET
+
+        notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+        title = 'Total $5 "hello" ]]> $(throw "not code")'
+        task = Task(title=title, body='正文 & < >\n"@')
+        with patch.object(notifier, "_ensure_start_menu_shortcut"), \
+             patch.object(notifier_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            notifier.send(task)
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        script = base64.b64decode(command[-1]).decode("utf-16-le")
+        self.assertNotIn(title, script)
+        xml_data = script.split("FromBase64String('", 1)[1].split("')", 1)[0]
+        document = ET.fromstring(base64.b64decode(xml_data).decode("utf-8"))
+        self.assertEqual(document.find(".//text[@id='1']").text, title)
+        self.assertEqual(document.find(".//text[@id='2']").text, task.body)
+        self.assertTrue(run.call_args.kwargs["check"])
+        with patch.object(notifier, "_ensure_start_menu_shortcut"), \
+             patch.object(notifier_module.subprocess, "run", side_effect=subprocess.CalledProcessError(7, "powershell")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                notifier.send(task)
+
+    def test_failed_workday_send_still_schedules_next_week(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.notifier.send.side_effect = OSError("发送失败")
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        finished = Event()
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_ERROR)
+        when = datetime.now() + timedelta(seconds=1)
+        following = when + timedelta(days=7)
+        task = Task(id="workday-fail", trigger_type="weekly_last_workday", trigger_config={"hour": 18})
+        with patch.object(scheduler, "_next_weekly_last_workday", side_effect=[when, following]):
+            scheduler.upsert_task(task)
+            self.assertTrue(finished.wait(5))
+        self.assertTrue(task.enabled)
+        self.assertEqual(scheduler._scheduler.get_job(task.id).next_run_time.replace(tzinfo=None), following)
+
+    def test_failed_once_send_is_not_marked_as_success(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.notifier.send.side_effect = OSError("发送失败")
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        when = datetime.now() + timedelta(hours=1)
+        task = Task(id="once-fail", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(task)
+        with self.assertRaises(OSError):
+            scheduler._run_task(task.id)
+        self.assertTrue(task.enabled)
+        self.assertIsNotNone(scheduler.task_next_run(task.id))
+        self.assertLess(scheduler._scheduler.get_job(task.id).next_run_time.replace(tzinfo=None), when)
+        scheduler.notifier.send.side_effect = None
+        scheduler._run_task(task.id)
+        self.assertFalse(task.enabled)
+
+    def test_failed_exit_save_keeps_application_running(self):
+        app = app_module.NoticeApp.__new__(app_module.NoticeApp)
+        app.root = MagicMock()
+        app.tray = MagicMock()
+        app.scheduler = MagicMock()
+        app._clock_after_id = "clock"
+        app._weather_after_id = "weather"
+        app._persist_tasks = MagicMock(side_effect=OSError("磁盘已满"))
+        with patch.object(app_module, "stop_helper") as stop, patch.object(app_module, "show_error") as error:
+            app.exit_app()
+        app.root.after_cancel.assert_not_called()
+        app.tray.stop.assert_not_called()
+        app.scheduler.shutdown.assert_not_called()
+        stop.assert_not_called()
+        error.assert_called_once()
+        self.assertEqual(app._clock_after_id, "clock")
+
+    def test_wake_helper_failure_allows_direct_fallback(self):
+        import single_instance as instance
+
+        with patch.object(instance, "_wake_exe_path", return_value=Path("wake.exe")), \
+             patch.object(instance.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            self.assertFalse(instance._send_via_helper())
+
+    def test_first_instance_starts_only_one_pipe_listener(self):
+        import single_instance as instance
+
+        kernel = MagicMock()
+        kernel.CreateMutexW.return_value = 123
+        kernel.GetLastError.return_value = 0
+        with patch.object(instance, "kernel32", kernel), \
+             patch.object(instance, "_mutex_handle", None), \
+             patch.object(instance.subprocess, "Popen") as helper, \
+             patch.object(instance.threading, "Thread") as thread:
+            instance.single_instance_guard()
+        helper.assert_not_called()
+        thread.return_value.start.assert_called_once()
+
+    def test_wake_write_failure_is_not_success(self):
+        import single_instance as instance
+        import wake
+
+        for module, operation in [(instance, instance._send_direct), (wake, lambda: wake._send_to_pipe(b"WAKE"))]:
+            kernel = MagicMock()
+            kernel.WaitNamedPipeW.return_value = True
+            kernel.CreateFileW.return_value = 123
+            kernel.WriteFile.return_value = False
+            with self.subTest(module=module.__name__), patch.object(module, "kernel32", kernel):
+                if module is instance:
+                    with patch.object(instance, "_listener_ready"):
+                        self.assertFalse(operation())
+                else:
+                    self.assertFalse(operation())
+            kernel.CloseHandle.assert_called_once_with(123)
+
+    def test_real_pipe_roundtrip_uses_only_main_listener(self):
+        import single_instance as instance
+        import wake
+        from uuid import uuid4
+
+        name = rf"\\.\pipe\NoticeTest_{uuid4().hex}"
+        ready, stop, received = Event(), Event(), Event()
+        with patch.object(instance, "PIPE_NAME", name), patch.object(wake, "PIPE_NAME", name), \
+             patch.object(instance, "_listener_ready", ready), patch.object(instance, "_listener_stop", stop), \
+             patch.object(instance, "_SHOW_CALLBACK", received.set):
+            thread = threading.Thread(target=instance._listener_thread, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(ready.wait(3))
+                self.assertTrue(wake._send_to_pipe(b"WAKE"))
+                self.assertTrue(received.wait(3))
+            finally:
+                stop.set()
+                deadline = time.monotonic() + 3
+                while thread.is_alive() and time.monotonic() < deadline:
+                    instance._send_direct()
+                    thread.join(0.05)
+                self.assertFalse(thread.is_alive(), "测试监听线程必须退出")
+
+    def test_wake_cli_returns_failure_exit_code(self):
+        import wake
+
+        for success in (False, True):
+            with self.subTest(success=success), patch.object(wake, "_send_to_pipe", return_value=success):
+                with self.assertRaises(SystemExit) as result:
+                    wake._run_wake()
+                self.assertEqual(result.exception.code, 0 if success else 1)
+
+    def test_notification_timeout_is_reported(self):
+        notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+        with patch.object(notifier, "_ensure_start_menu_shortcut"), \
+             patch.object(notifier_module.subprocess, "run", side_effect=subprocess.TimeoutExpired("powershell", 15)), \
+             patch.object(notifier_module.pythoncom, "CoUninitialize") as release:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                notifier.send(Task())
+        release.assert_called_once()
+
     def test_one_off_is_disabled_after_real_execution(self):
         notifier = MagicMock()
         finished = Event()
@@ -1117,7 +1273,7 @@ class CoreRegressionTests(unittest.TestCase):
             scheduler._scheduler.add_listener(completed, EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
             with patch.object(notifier_module, "START_MENU_DIR", Path(directory)), \
                  patch.object(notifier_module, "SHORTCUT_FILE", Path(directory) / "notice.lnk"), \
-                 patch.object(notifier_module, "Notification") as toast:
+                  patch.object(notifier_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as send:
                 scheduler.start()
                 try:
                     # 同 test_one_off_is_disabled_after_real_execution：窗口太窄时任务还没排上就过期，
@@ -1129,7 +1285,7 @@ class CoreRegressionTests(unittest.TestCase):
                     ))
                     self.assertTrue(finished.wait(10), "调度任务没有执行")
                     self.assertEqual(errors, [])
-                    toast.return_value.show.assert_called_once()
+                    send.assert_called_once()
                 finally:
                     scheduler._scheduler.shutdown(wait=True)
 

@@ -41,12 +41,25 @@ class TaskStore:
         # 原因写入运行日志，窗口化运行时也能追查。
         tasks: list[Task] = []
         problems: list[str] = []
+        reserved_ids = {str(item["id"]) for item in records if isinstance(item, dict) and "id" in item}
+        seen_ids: set[str] = set()
         for index, item in enumerate(records):
             if not isinstance(item, dict):
                 # 连提醒对象都不是（被写成了字符串/数字等），既没法展示也没法编辑，只能跳过。
                 problems.append(f"第 {index + 1} 条不是提醒对象，已跳过：{item!r}")
                 continue
             task = Task.from_dict(item, strict=False)
+            if task.id in seen_ids or not task.id or task.id.startswith("snooze:"):
+                original_id = task.id
+                task.id = Task().id
+                while task.id in reserved_ids:
+                    task.id = Task().id
+                reserved_ids.add(task.id)
+                task.enabled = False
+                task.next_run = None
+                reason = f"提醒 ID 重复或不可用（原值 {original_id!r}），已分配新 ID 并停用"
+                task.load_warning = f"{task.load_warning}；{reason}" if task.load_warning else reason
+            seen_ids.add(task.id)
             tasks.append(task)
             if task.load_warning:
                 problems.append(f"第 {index + 1} 条（{task.id}）：{task.load_warning}")

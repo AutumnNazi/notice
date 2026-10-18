@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import json
 import os
 import sys
 import time
@@ -79,6 +80,27 @@ class TaskFileCorruptionTests(unittest.TestCase):
         path, tasks, diagnostics = self.load(raw)
         self.assertEqual(tasks, [])
         self.assert_quarantined(path, raw, diagnostics, "UTF-8")
+
+    def test_duplicate_ids_preserve_both_records_without_schedule_collision(self):
+        records = [{"id": "same", "title": title, "trigger_type": "interval",
+                    "trigger_config": {"hours": 1}} for title in ("第一条", "第二条")]
+        raw = json.dumps({"tasks": records}, ensure_ascii=False).encode("utf-8")
+        path, tasks, diagnostics = self.load(raw)
+        self.assertEqual([task.title for task in tasks], ["第一条", "第二条"])
+        self.assertEqual(len({task.id for task in tasks}), 2)
+        self.assertTrue(tasks[0].enabled)
+        self.assertFalse(tasks[1].enabled)
+        self.assertIn("重复", diagnostics)
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_reserved_or_empty_task_ids_are_reassigned_and_disabled(self):
+        records = [{"id": value, "title": "保留记录", "trigger_type": "interval",
+                    "trigger_config": {"hours": 1}} for value in ("", "snooze:other")]
+        raw = json.dumps({"tasks": records}, ensure_ascii=False).encode("utf-8")
+        _path, tasks, diagnostics = self.load(raw)
+        self.assertEqual(len(tasks), 2)
+        self.assertTrue(all(task.id and not task.id.startswith("snooze:") and not task.enabled for task in tasks))
+        self.assertIn("不可用", diagnostics)
 
     def test_non_object_top_level_returns_empty_list(self):
         raw = b'[{"id": "1"}]'

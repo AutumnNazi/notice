@@ -1,17 +1,18 @@
-"""单实例守卫 —— 优先用 wake.exe（快），回退到主进程管道线程。"""
+"""单实例守卫：主进程单独监听，wake.exe 仅负责发送唤醒信号。"""
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
-import os
 import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import Callable
 
-from config import APP_NAME
+from core.app_logging import get_logger
+
+_LOGGER = get_logger(__name__)
 
 MUTEX_NAME = "Global\\NoticeHelper_SingleInstance"
 PIPE_NAME = r"\\.\pipe\NoticeHelper_WakeUp"
@@ -60,41 +61,51 @@ PIPE_WAIT = 0x00000000
 _SHOW_CALLBACK: Callable[[], None] | None = None
 _listener_ready = threading.Event()
 
-_wake_helper: subprocess.Popen | None = None
+_mutex_handle = None
+_listener_stop = threading.Event()
 
 
 # ── 主进程内管道监听（回退方案）────────────────────────────────────────
 def _listener_thread() -> None:
-    while True:
+    while not _listener_stop.is_set():
         pipe = kernel32.CreateNamedPipeW(
             PIPE_NAME, PIPE_ACCESS_INBOUND,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             1, 0, 0, 0, None,
         )
         if pipe == INVALID_HANDLE:
+            _LOGGER.error("创建唤醒管道失败：WinError=%s", kernel32.GetLastError())
             _listener_ready.set()
             break
         _listener_ready.set()
-        ok = kernel32.ConnectNamedPipe(pipe, None)
-        if ok:
-            buf = ctypes.create_string_buffer(64)
-            kernel32.ReadFile(pipe, buf, 64, ctypes.byref(ctypes.wintypes.DWORD()), None)
-        kernel32.CloseHandle(pipe)
-        if _SHOW_CALLBACK is not None:
-            _SHOW_CALLBACK()
+        try:
+            ok = kernel32.ConnectNamedPipe(pipe, None)
+            # 客户端先于 ConnectNamedPipe 连上时，ERROR_PIPE_CONNECTED 同样表示可读。
+            if ok or kernel32.GetLastError() == 535:
+                buf = ctypes.create_string_buffer(64)
+                read = ctypes.wintypes.DWORD()
+                received = kernel32.ReadFile(pipe, buf, 64, ctypes.byref(read), None)
+                if received and buf.raw[:read.value] == b"WAKE" and not _listener_stop.is_set():
+                    if _SHOW_CALLBACK is not None:
+                        _SHOW_CALLBACK()
+        except Exception:
+            _LOGGER.exception("处理唤醒请求失败")
+        finally:
+            kernel32.CloseHandle(pipe)
 
 
 def _send_direct() -> bool:
     """直接连接管道发送唤醒（回退方案）。"""
-    _listener_ready.wait(timeout=5)
-    kernel32.WaitNamedPipeW(PIPE_NAME, 3000)
+    if not kernel32.WaitNamedPipeW(PIPE_NAME, 3000):
+        return False
     h = kernel32.CreateFileW(PIPE_NAME, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
     if h == INVALID_HANDLE:
         return False
-    written = ctypes.wintypes.DWORD()
-    kernel32.WriteFile(h, b"WAKE", 4, ctypes.byref(written), None)
-    kernel32.CloseHandle(h)
-    return True
+    try:
+        written = ctypes.wintypes.DWORD()
+        return bool(kernel32.WriteFile(h, b"WAKE", 4, ctypes.byref(written), None)) and written.value == 4
+    finally:
+        kernel32.CloseHandle(h)
 
 
 # ── wake helper 管理 ─────────────────────────────────────────────────
@@ -107,44 +118,36 @@ def _wake_exe_path() -> Path | None:
     return exe if exe.exists() else None
 
 
-def _start_helper_listener() -> None:
-    """启动 wake.exe 常驻监听进程。"""
-    global _wake_helper
-    exe = _wake_exe_path()
-    if exe is None:
-        return
-    try:
-        _wake_helper = subprocess.Popen(
-            [str(exe), "--listener"],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-        )
-    except Exception:
-        pass
-
-
 def _send_via_helper() -> bool:
     """通过 wake.exe 发送唤醒信号。"""
     exe = _wake_exe_path()
     if exe is None:
         return False
     try:
-        subprocess.run([str(exe), "--wake"], timeout=5,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception:
+        result = subprocess.run([str(exe), "--wake"], timeout=5,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        _LOGGER.warning("唤醒助手失败，改用直接管道", exc_info=True)
         return False
 
 
 # ── 公开接口 ─────────────────────────────────────────────────────────
 def single_instance_guard() -> None:
-    kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    global _mutex_handle
+    _mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    if not _mutex_handle:
+        raise ctypes.WinError(kernel32.GetLastError())
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
         # 优先用 helper（快），失败则用直接管道
-        if not _send_via_helper():
-            _send_direct()
-        sys.exit(0)
-    # 首个实例：启动 helper 监听 + 主进程回退监听
-    _start_helper_listener()
+        sent = _send_via_helper() or _send_direct()
+        kernel32.CloseHandle(_mutex_handle)
+        _mutex_handle = None
+        if not sent:
+            _LOGGER.error("已有实例，但唤醒信号发送失败")
+        sys.exit(0 if sent else 1)
+    _listener_stop.clear()
     threading.Thread(target=_listener_thread, daemon=True).start()
 
 
@@ -154,7 +157,6 @@ def register_show_callback(callback: Callable[[], None]) -> None:
 
 
 def stop_helper() -> None:
-    global _wake_helper
-    if _wake_helper and _wake_helper.poll() is None:
-        _wake_helper.terminate()
-        _wake_helper = None
+    _listener_stop.set()
+    _send_direct()
+    # 互斥句柄留到进程退出由 Windows 释放，避免退出清理期间第二实例抢先启动。
