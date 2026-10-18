@@ -112,16 +112,34 @@ class TaskScheduler:
                 self._notify_changed()
 
     def pause_all(self) -> None:
-        self._paused = True
-        self._scheduler.pause()
-        self._refresh_next_runs()
-        self._notify_changed()
+        with self._lock:
+            self._paused = True
+            self._scheduler.pause()
+            self._refresh_next_runs()
+            self._notify_changed()
 
     def resume_all(self) -> None:
-        self._paused = False
-        self._scheduler.resume()
-        self._refresh_next_runs()
-        self._notify_changed()
+        with self._lock:
+            self._paused = False
+            self._scheduler.resume()
+            self._refresh_next_runs()
+            self._notify_changed()
+
+    def _defer_paused_job(self, task: Task, *, snooze: bool = False) -> None:
+        if not self._paused or self._stopping:
+            return
+        job_id = self._snooze_job_id(task.id) if snooze else task.id
+        # 等调度线程完成取走单次 job，再放回暂停中的队列；不覆盖编辑或新安排的 job。
+        with self._scheduler._jobstores_lock:
+            if self._scheduler.get_job(job_id) is None:
+                self._scheduler.add_job(
+                    self._fire_snooze if snooze else self._run_task,
+                    DateTrigger(run_date=datetime.now()), id=job_id, args=[task.id],
+                    # 恢复可能先于旧 worker 收尾，允许这次不发送的旧调用与补发调用短暂重叠。
+                    replace_existing=True, misfire_grace_time=None, max_instances=2,
+                )
+        if not snooze:
+            task.next_run = None
 
     @property
     def paused(self) -> bool:
@@ -186,19 +204,26 @@ class TaskScheduler:
         """
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or self._paused or self._stopping:
+            if task is None or self._stopping:
+                return
+            if self._paused:
+                self._defer_paused_job(task, snooze=True)
                 return
         self.notifier.send(task)
 
     def _run_task(self, task_id: str) -> None:
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or not task.enabled or self._paused or self._stopping:
+            if task is None or not task.enabled or self._stopping:
+                return
+            if self._paused:
+                if task.trigger_type in {"once", "weekly_last_workday"}:
+                    self._defer_paused_job(task)
                 return
         failure = None
         try:
-            if self._notify(task_id, expected=task) is None:
-                return
+            # 锁内已确定发送边界；暂停后恢复的二次检查不能吞掉已取走的单次 job。
+            self.notifier.send(task)
         except Exception as exc:
             failure = exc
             _LOGGER.error("提醒“%s”发送失败：%s", task.title, exc)

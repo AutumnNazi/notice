@@ -999,6 +999,106 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_pause_after_dispatch_replays_once_reminder_on_resume(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        finished = Event()
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_EXECUTED)
+        with scheduler._lock:
+            when = datetime.now() + timedelta(seconds=0.3)
+            task = Task(id="pause-dispatch", trigger_type="once",
+                        trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+            scheduler.upsert_task(task)
+            deadline = time.monotonic() + 3
+            while scheduler._scheduler.get_job(task.id) is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNone(scheduler._scheduler.get_job(task.id), "等待调度器确实取走单次 job")
+            scheduler.pause_all()
+        self.assertTrue(finished.wait(3))
+        scheduler.notifier.send.assert_not_called()
+        self.assertIsNotNone(scheduler._scheduler.get_job(task.id), "暂停必须保留已取走的单次提醒")
+        finished.clear()
+        scheduler.resume_all()
+        self.assertTrue(finished.wait(3))
+        scheduler.notifier.send.assert_called_once_with(task)
+        self.assertFalse(task.enabled)
+
+    def test_pause_after_snooze_dispatch_preserves_supplemental_reminder(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        finished = Event()
+        scheduler._scheduler.add_listener(lambda _event: finished.set(), EVENT_JOB_EXECUTED)
+        task = Task(id="pause-snooze", enabled=False)
+        with scheduler._lock:
+            scheduler.upsert_task(task)
+            scheduler.snooze_task(task.id, minutes=0)
+            job_id = scheduler._snooze_job_id(task.id)
+            deadline = time.monotonic() + 3
+            while scheduler._scheduler.get_job(job_id) is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNone(scheduler._scheduler.get_job(job_id))
+            scheduler.pause_all()
+        self.assertTrue(finished.wait(3))
+        self.assertIsNotNone(scheduler._scheduler.get_job(job_id))
+        scheduler.notifier.send.assert_not_called()
+        finished.clear()
+        scheduler.resume_all()
+        self.assertTrue(finished.wait(3))
+        scheduler.notifier.send.assert_called_once_with(task)
+        self.assertFalse(task.enabled)
+
+    def test_paused_replay_does_not_replace_existing_new_schedule(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        when = datetime.now() + timedelta(hours=1)
+        task = Task(id="pause-existing", trigger_type="once",
+                    trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+        scheduler.upsert_task(task)
+        original = scheduler._scheduler.get_job(task.id)
+        scheduler.pause_all()
+        scheduler._run_task(task.id)
+        self.assertIs(scheduler._scheduler.get_job(task.id), original)
+        scheduler.resume_all()
+        scheduler.notifier.send.assert_not_called()
+
+    def test_resume_before_paused_worker_finishes_does_not_drop_replay(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        deferred, release, sent = Event(), Event(), Event()
+        scheduler.notifier.send.side_effect = lambda _task: sent.set()
+        original_run = scheduler._run_task
+        calls = []
+
+        def delayed_worker(task_id):
+            calls.append(task_id)
+            original_run(task_id)
+            if len(calls) == 1:
+                deferred.set()
+                release.wait(3)
+
+        with patch.object(scheduler, "_run_task", delayed_worker):
+            try:
+                with scheduler._lock:
+                    when = datetime.now() + timedelta(seconds=0.3)
+                    task = Task(id="resume-inflight", trigger_type="once",
+                                trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+                    scheduler.upsert_task(task)
+                    deadline = time.monotonic() + 3
+                    while scheduler._scheduler.get_job(task.id) is not None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertIsNone(scheduler._scheduler.get_job(task.id))
+                    scheduler.pause_all()
+                self.assertTrue(deferred.wait(3))
+                scheduler.resume_all()
+                self.assertTrue(sent.wait(3), "旧 worker 尚未退出也不能让补发被 max_instances 丢弃")
+            finally:
+                release.set()
+        scheduler.notifier.send.assert_called_once_with(task)
+
     def test_malformed_weekdays_can_be_opened_and_repaired_in_editor(self):
         root = tk.Tk()
         root.withdraw()
