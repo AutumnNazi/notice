@@ -988,7 +988,8 @@ class CoreRegressionTests(unittest.TestCase):
         command = run.call_args.args[0]
         script = base64.b64decode(command[-1]).decode("utf-16-le")
         self.assertNotIn(title, script)
-        xml_data = script.split("FromBase64String('", 1)[1].split("')", 1)[0]
+        xml_data = run.call_args.kwargs.get("input")
+        self.assertIsNotNone(xml_data, "通知正文应从标准输入传递，避免命令行长度限制")
         document = ET.fromstring(base64.b64decode(xml_data).decode("utf-8"))
         self.assertEqual(document.find(".//text[@id='1']").text, title)
         self.assertEqual(document.find(".//text[@id='2']").text, task.body)
@@ -1128,6 +1129,56 @@ class CoreRegressionTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 notifier.send(Task())
         release.assert_called_once()
+
+    def test_long_notification_does_not_expand_windows_command_line(self):
+        notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+        task = Task(body="长正文" * 5000)
+        with patch.object(notifier, "_ensure_start_menu_shortcut"), \
+             patch.object(notifier_module.subprocess, "run") as run:
+            notifier.send(task)
+        command = subprocess.list2cmdline(run.call_args.args[0])
+        self.assertLess(len(command), 32767)
+        self.assertTrue(run.call_args.kwargs.get("input"))
+
+    def test_failed_settings_save_preserves_active_settings(self):
+        app = app_module.NoticeApp.__new__(app_module.NoticeApp)
+        app.root = MagicMock()
+        app.font_family_var = MagicMock()
+        app.font_family_var.get.return_value = "旧字体"
+        app.autostart_var = MagicMock()
+        app.autostart_var.get.return_value = False
+        app._font_choices = lambda: []
+        app.settings = {"font_family": "旧字体", "custom_font_dir": "", "close_action": "ask"}
+        before = app.settings.copy()
+        app.store = MagicMock()
+        app.store.save_settings.side_effect = OSError("磁盘已满")
+        app._rebuild_ui = MagicMock()
+        result = {"font_family": "新字体", "custom_font_dir": "", "close_action": "exit", "autostart_enabled": False}
+        with patch.object(app_module, "SettingsDialog", return_value=SimpleNamespace(result=result)), \
+             patch.object(app_module, "show_error") as error:
+            app.open_settings()
+        self.assertEqual(app.settings, before)
+        app.font_family_var.set.assert_not_called()
+        app._rebuild_ui.assert_not_called()
+        error.assert_called_once()
+
+    def test_failed_remember_close_keeps_window_and_old_choice(self):
+        app = app_module.NoticeApp.__new__(app_module.NoticeApp)
+        app.root = MagicMock()
+        app.font_family_var = MagicMock()
+        app.font_family_var.get.return_value = "旧字体"
+        app.settings = {"font_family": "旧字体", "close_action": "ask"}
+        app.store = MagicMock()
+        app.store.save_settings.side_effect = OSError("磁盘已满")
+        app.hide_window = MagicMock()
+        app.exit_app = MagicMock()
+        with patch.object(app_module, "CloseChoiceDialog", return_value=SimpleNamespace(result={"action": "exit", "remember": True})), \
+             patch.object(app_module, "show_error") as error:
+            app.on_close_requested()
+        self.assertEqual(app.settings["close_action"], "ask")
+        app.hide_window.assert_not_called()
+        app.exit_app.assert_not_called()
+        error.assert_called_once()
 
     def test_one_off_is_disabled_after_real_execution(self):
         notifier = MagicMock()

@@ -48,7 +48,7 @@ $ErrorActionPreference = 'Stop';
 [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null;
 $xml = [Windows.Data.Xml.Dom.XmlDocument]::new();
-$xml.LoadXml([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{xml_data}')));
+$xml.LoadXml([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())));
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml);
 $toast.Tag = '{tag}';
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($toast);
@@ -57,6 +57,7 @@ $toast.Tag = '{tag}';
             subprocess.run(
                 [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
                 check=True, capture_output=True, encoding="utf-8", errors="replace",
+                input=xml_data,
                 timeout=NOTIFICATION_TIMEOUT_SECONDS, creationflags=subprocess.CREATE_NO_WINDOW,
             )
         except (OSError, subprocess.SubprocessError) as exc:

@@ -1561,9 +1561,10 @@ class NoticeApp:
         self._set_random_quote()
         self._start_quote_rotation()
 
-    def _persist_settings(self) -> None:
-        self.settings["font_family"] = self.font_family_var.get()
-        self.store.save_settings(self.settings)
+    def _persist_settings(self, changes: dict[str, object] | None = None) -> None:
+        updated = self.settings | {"font_family": self.font_family_var.get()} | (changes or {})
+        self.store.save_settings(updated)
+        self.settings = updated
 
     def _font_directories(self) -> list[Path]:
         dirs = [FONT_DIR]
@@ -1602,14 +1603,20 @@ class NoticeApp:
 
         desired_autostart = bool(dialog.result["autostart_enabled"])
         selected_font = str(dialog.result["font_family"])
+        try:
+            self._persist_settings({
+                "font_family": selected_font,
+                "custom_font_dir": str(dialog.result["custom_font_dir"]),
+                "close_action": str(dialog.result["close_action"]),
+            })
+        except Exception as exc:
+            logging.getLogger(__name__).error("保存设置失败：%s", exc, exc_info=True)
+            show_error(self.root, "设置保存失败", f"原设置保持不变，请处理后重试：{exc}")
+            return
         self.font_family_var.set(selected_font)
-        self.settings["font_family"] = selected_font
-        self.settings["custom_font_dir"] = str(dialog.result["custom_font_dir"])
-        self.settings["close_action"] = str(dialog.result["close_action"])
         if self.settings["custom_font_dir"]:
             register_font_directories([Path(str(self.settings["custom_font_dir"]))])
             self.fonts = sorted(set(tkfont.families(self.root)))
-        self._persist_settings()
         self._rebuild_ui()
         if desired_autostart != self.autostart_var.get():
             self.autostart_var.set(desired_autostart)
@@ -1778,8 +1785,12 @@ class NoticeApp:
             return
         chosen = str(dialog.result["action"])
         if bool(dialog.result["remember"]):
-            self.settings["close_action"] = chosen
-            self._persist_settings()
+            try:
+                self._persist_settings({"close_action": chosen})
+            except Exception as exc:
+                logging.getLogger(__name__).error("保存关闭选择失败：%s", exc, exc_info=True)
+                show_error(self.root, "关闭失败", f"无法保存关闭选择，窗口保持打开，请处理后重试：{exc}")
+                return
         if chosen == "tray":
             self.hide_window()
         else:
