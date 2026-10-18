@@ -1170,6 +1170,51 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_notification_text_rejects_xml_controls_but_keeps_valid_unicode(self):
+        for field in ("title", "body"):
+            for value in ("内容\x00", "内容\x01", "内容\ufffe", "内容\ud800"):
+                with self.subTest(field=field, value=repr(value)), self.assertRaises(ValueError):
+                    task = Task(trigger_type="interval", trigger_config={"minutes": 1})
+                    setattr(task, field, value)
+                    task.validate()
+        title, body = "中文 \U0001f680 & < >", "第一行\n第二行\t字段\r\n结束"
+        task = Task(title=title, body=body, trigger_type="interval", trigger_config={"minutes": 1})
+        task.validate()
+        self.assertEqual((task.title, task.body), (title, body))
+
+    def test_snooze_does_not_schedule_disabled_task_with_invalid_notification_text(self):
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.start()
+        self.addCleanup(scheduler._scheduler.shutdown, wait=True)
+        task = Task(id="invalid-text-snooze", body="坏字符\x01", enabled=False)
+        scheduler.upsert_task(task)
+        with self.assertRaises(ValueError):
+            scheduler.snooze_task(task.id)
+        self.assertIsNone(scheduler._scheduler.get_job(scheduler._snooze_job_id(task.id)))
+
+    def test_invalid_notification_text_is_rejected_before_com_or_child_process(self):
+        notifier = notifier_module.Notifier.__new__(notifier_module.Notifier)
+        with patch.object(notifier_module.pythoncom, "CoInitialize") as initialize, \
+             patch.object(notifier_module.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                notifier.send(Task(title="无效\x00标题"))
+        initialize.assert_not_called()
+        run.assert_not_called()
+
+    def test_editor_keeps_open_when_body_contains_xml_invalid_character(self):
+        dialog = SimpleNamespace(
+            trigger_type_var=SimpleNamespace(get=lambda: "interval"),
+            _collect_trigger_config=lambda _kind: {"minutes": 1},
+            body_text=None, title_var=SimpleNamespace(get=lambda: "有效标题"),
+            body_var=SimpleNamespace(get=lambda: "正文\x01内容"), enabled_var=SimpleNamespace(get=lambda: True),
+            _task=None, result=None, destroy=MagicMock(),
+        )
+        with patch("gui.task_dialog.show_error") as error:
+            TaskDialog._save(dialog)
+        self.assertIsNone(dialog.result)
+        dialog.destroy.assert_not_called()
+        self.assertIn("U+0001", error.call_args.args[2])
+
     def test_cron_rejects_impossible_date_but_keeps_leap_day_and_month_ranges(self):
         scheduler = TaskScheduler(MagicMock())
         for expression in ("0 9 30 2 *", "0 9 31 4 *"):

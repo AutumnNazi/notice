@@ -130,6 +130,22 @@ class TaskFileCorruptionTests(unittest.TestCase):
             self.assertEqual(store.load_tasks()[0].title, tasks[0].title)
             self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
 
+    def test_xml_invalid_notification_characters_are_disabled_and_preserved(self):
+        for field in ("title", "body"):
+            for character in ("\x00", "\x01", "\x0b", "\ufffe", "\uffff"):
+                with self.subTest(field=field, character=repr(character)):
+                    record = {"id": "invalid-xml", "title": "有效标题", "body": "有效正文",
+                              "trigger_type": "interval", "trigger_config": {"minutes": 1}}
+                    record[field] += character
+                    raw = json.dumps({"tasks": [record]}, ensure_ascii=False).encode("utf-8")
+                    path, tasks, diagnostics = self.load(raw)
+                    self.assertFalse(tasks[0].enabled)
+                    self.assertEqual(getattr(tasks[0], field), record[field])
+                    self.assertIn("U+", diagnostics)
+                    self.assertEqual([p.read_bytes() for p in path.parent.glob("*.corrupt-*")], [raw])
+                    with self.assertRaises(ValueError):
+                        Task.from_dict(record)
+
     def test_unsupported_json_numbers_are_quarantined_and_safe_to_save(self):
         for value in ("NaN", "Infinity", "-Infinity", "1e999", "9" * 5000):
             with self.subTest(value=value[:20]):

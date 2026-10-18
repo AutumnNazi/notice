@@ -13,7 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from chinese_calendar import is_workday
 
 from core.app_logging import get_logger
-from core.models import Task
+from core.models import Task, validate_notification_text
 from core.notifier import Notifier
 
 _LOGGER = get_logger(__name__)
@@ -313,6 +313,8 @@ class TaskScheduler:
         with self._lock:
             if self._stopping or task_id not in self._tasks:
                 return False
+            task = self._tasks[task_id]
+            validate_notification_text(task.title, task.body)
             request = object()
             self._scheduler.add_job(
                 self._fire_snooze,

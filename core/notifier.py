@@ -14,7 +14,7 @@ from win32com.propsys import propsys, pscon
 from config import APP_ID, APP_NAME, ICON_ICO_FILE, SHORTCUT_FILE, START_MENU_DIR, TOAST_IMAGE_FILE
 from core.icon_assets import ensure_icon_assets
 from core.app_logging import get_logger
-from core.models import Task
+from core.models import Task, validate_notification_text
 
 _LOGGER = get_logger(__name__)
 POWERSHELL = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -27,6 +27,7 @@ class Notifier:
         self._ensure_start_menu_shortcut()
 
     def send(self, task: Task) -> None:
+        validate_notification_text(task.title, task.body)
         # 调度器使用工作线程，COM 必须在实际调用线程初始化并配对释放。
         pythoncom.CoInitialize()
         try:

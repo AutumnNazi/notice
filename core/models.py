@@ -13,6 +13,17 @@ from config import DEFAULT_TITLE
 TRIGGER_TYPE_VALUES = {"once", "interval", "weekly", "weekly_last_workday", "yearly", "cron"}
 
 
+def validate_notification_text(title: str, body: str) -> None:
+    for label, text in (("标题", title), ("正文", body)):
+        if not isinstance(text, str):
+            raise ValueError(f"提醒{label}必须是文本。")
+        for character in text:
+            code = ord(character)
+            if not (code in (9, 10, 13) or 0x20 <= code <= 0xD7FF
+                    or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF):
+                raise ValueError(f"提醒{label}包含通知不支持的字符 U+{code:04X}，请移除后保存。")
+
+
 def validate_interval_config(config: dict[str, Any]) -> dict[str, int]:
     values: dict[str, int] = {}
     for key in ("weeks", "days", "hours", "minutes", "seconds"):
@@ -151,6 +162,7 @@ class Task:
         return self
 
     def validate(self) -> None:
+        validate_notification_text(self.title, self.body)
         if not isinstance(self.enabled, bool) or not isinstance(self.sound, bool):
             raise ValueError("enabled 和 sound 必须是布尔值。")
         if self.trigger_type not in TRIGGER_TYPE_VALUES:
