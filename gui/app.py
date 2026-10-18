@@ -985,10 +985,14 @@ class NoticeApp:
         threading.Thread(target=worker, daemon=True, name="live-info-lunar").start()
 
     def _apply_lunar(self, day: date, month_day: str | None, ganzhi: str | None) -> None:
-        self._lunar_pending = None
         if day != datetime.now().date():
-            self._lunar_retry_at = 0.0
+            # 延迟的旧结果只能释放自己的请求，不能取消当天取数或覆盖当天退避时间。
+            if self._lunar_pending == day:
+                self._lunar_pending = None
+                self._lunar_retry_at = 0.0
             return
+        if self._lunar_pending == day:
+            self._lunar_pending = None
         if month_day is None or ganzhi is None:
             self._lunar_retry_at = time.monotonic() + LUNAR_RETRY_SECONDS
             self.lunar_var.set("农历获取失败，稍后重试")

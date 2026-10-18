@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -115,6 +115,89 @@ class WeatherServiceTests(unittest.TestCase):
                               (date(2025, 7, 25), ("闰六月初一", "乙巳年  蛇年"))):
             with self.subTest(day=day):
                 self.assertEqual(live_info.lunar_date(day), expected)
+
+
+class LunarResultStateTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 18, 10)
+        self.app = app_module.NoticeApp.__new__(app_module.NoticeApp)
+        self.app._lunar_day = None
+        self.app._lunar_pending = self.now.date()
+        self.app._lunar_retry_at = 1000.0
+        self.app._weather = None
+        self.app._weather_failed = True
+        self.app.weather_var = MagicMock()
+        self.app.lunar_var = MagicMock()
+        self.app.ganzhi_var = MagicMock()
+        self.app._refresh_lunar_async = MagicMock()
+
+    def test_previous_day_result_keeps_current_request_and_backoff(self):
+        for result in (("旧月日", "旧年份"), (None, None)):
+            with self.subTest(result=result), patch.object(app_module, "datetime", wraps=datetime) as clock:
+                clock.now.return_value = self.now
+                self.app._apply_lunar(self.now.date() - timedelta(days=1), *result)
+                self.assertEqual(self.app._lunar_pending, self.now.date())
+                self.assertEqual(self.app._lunar_retry_at, 1000.0)
+                self.app._refresh_live_info(self.now)
+        self.app._refresh_lunar_async.assert_not_called()
+        self.app.lunar_var.set.assert_not_called()
+        self.app.ganzhi_var.set.assert_not_called()
+
+    def test_previous_day_result_keeps_current_failure_backoff_without_pending_request(self):
+        self.app._lunar_pending = None
+        with patch.object(app_module, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = self.now
+            self.app._apply_lunar(self.now.date() - timedelta(days=1), None, None)
+        self.assertIsNone(self.app._lunar_pending)
+        self.assertEqual(self.app._lunar_retry_at, 1000.0)
+
+    def test_finished_old_request_is_released_so_current_day_can_start(self):
+        previous = self.now.date() - timedelta(days=1)
+        self.app._lunar_pending = previous
+        with patch.object(app_module, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = self.now
+            self.app._apply_lunar(previous, "旧月日", "旧年份")
+        self.assertIsNone(self.app._lunar_pending)
+        self.assertEqual(self.app._lunar_retry_at, 0.0)
+        self.app._refresh_live_info(self.now)
+        self.app._refresh_lunar_async.assert_called_once_with(self.now.date())
+        self.assertEqual(self.app._lunar_pending, self.now.date())
+
+    def test_current_success_releases_request_and_updates_display(self):
+        with patch.object(app_module, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = self.now
+            self.app._apply_lunar(self.now.date(), "九月初八", "丙午年")
+        self.assertIsNone(self.app._lunar_pending)
+        self.assertEqual(self.app._lunar_day, self.now.date())
+        self.assertEqual(self.app._lunar_retry_at, 0.0)
+        self.app.lunar_var.set.assert_called_once_with("九月初八")
+        self.app.ganzhi_var.set.assert_called_once_with("丙午年")
+
+    def test_current_failure_releases_request_and_sets_retry_deadline(self):
+        with patch.object(app_module, "datetime", wraps=datetime) as clock, \
+             patch.object(app_module.time, "monotonic", return_value=2000.0):
+            clock.now.return_value = self.now
+            self.app._apply_lunar(self.now.date(), None, None)
+            self.app._refresh_live_info(self.now)
+        self.assertIsNone(self.app._lunar_pending)
+        self.assertEqual(self.app._lunar_retry_at, 2000.0 + app_module.LUNAR_RETRY_SECONDS)
+        self.app._refresh_lunar_async.assert_not_called()
+        self.app.lunar_var.set.assert_called_once_with("农历获取失败，稍后重试")
+
+    def test_queue_applies_current_result_after_discarding_previous_day_result(self):
+        self.app._live_info_queue = app_module.queue.Queue()
+        self.app._live_info_queue.put(("lunar", (self.now.date() - timedelta(days=1), "旧月日", "旧年份")))
+        self.app._live_info_queue.put(("lunar", (self.now.date(), "九月初八", "丙午年")))
+        with patch.object(app_module, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = self.now
+            self.app._drain_live_info()
+            self.app._refresh_live_info(self.now)
+        self.assertTrue(self.app._live_info_queue.empty())
+        self.assertIsNone(self.app._lunar_pending)
+        self.assertEqual(self.app._lunar_day, self.now.date())
+        self.app.lunar_var.set.assert_called_once_with("九月初八")
+        self.app.ganzhi_var.set.assert_called_once_with("丙午年")
+        self.app._refresh_lunar_async.assert_not_called()
 
 
 class LiveInfoUITests(unittest.TestCase):
