@@ -68,23 +68,19 @@ def _wait_until_unlocked(paths: Iterable[Path], *, timeout: float = LOCK_TIMEOUT
 def kill_old():
     """终止正在运行的旧实例。"""
     print("[1/5] 终止旧进程...")
-    # 杀所有匹配的时辰筏进程（含 onedir 和旧 onefile 产物）
+    targets = (MAIN_EXE, WAKE_EXE, DIST / f"{EXE_NAME}.exe", DIST / "wake.exe")
+    paths = ", ".join("'" + str(path.resolve()).replace("'", "''") + "'" for path in targets)
+    # 只停止本项目产物路径下的旧实例，名称含 wake 的其它软件不属于清理范围。
     ps = (
-        f"Get-Process | Where-Object {{$_.ProcessName -like '*{EXE_NAME}*'}} "
-        f"| Stop-Process -Force -ErrorAction SilentlyContinue"
+        "$ErrorActionPreference = 'Stop'; "
+        f"$targets = @({paths}); "
+        "Get-Process | Where-Object { $_.Path -in $targets } | Stop-Process -Force"
     )
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # 也杀 wake.exe
-    ps2 = (
-        "Get-Process | Where-Object {$_.ProcessName -like '*wake*'} "
-        "| Stop-Process -Force -ErrorAction SilentlyContinue"
-    )
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps2],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                   check=True, timeout=LOCK_TIMEOUT, creationflags=subprocess.CREATE_NO_WINDOW)
 
     # 等文件锁释放：只有真的还被占用才等，未占用立刻返回
-    locked = _wait_until_unlocked([MAIN_EXE, DIST / f"{EXE_NAME}.exe", DIST / "wake.exe"])
+    locked = _wait_until_unlocked(targets)
     if locked:
         print(f"       等待 {LOCK_TIMEOUT:.0f} 秒后仍有进程占用产物，继续打包可能失败：")
         for path in locked:

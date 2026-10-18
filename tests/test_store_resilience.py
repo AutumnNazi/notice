@@ -337,6 +337,46 @@ class BuildLockProbeTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             self.assertFalse(build._is_locked(Path(directory) / "没有这个文件.exe"))
 
+    def test_stop_old_instances_matches_exact_executable_paths(self):
+        with patch("build.subprocess.run") as run, patch("build._wait_until_unlocked", return_value=[]):
+            build.kill_old()
+        run.assert_called_once()
+        script = run.call_args.args[0][-1]
+        for path in (build.MAIN_EXE, build.WAKE_EXE, build.DIST / f"{build.EXE_NAME}.exe", build.DIST / "wake.exe"):
+            self.assertIn(str(path.resolve()).replace("'", "''"), script)
+        self.assertIn("$_.Path -in $targets", script)
+        self.assertNotIn("ProcessName", script)
+        self.assertNotIn("SilentlyContinue", script)
+        self.assertTrue(run.call_args.kwargs["check"])
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
+
+    def test_stop_failure_prevents_cleanup_and_build(self):
+        import subprocess
+
+        with patch("build.subprocess.run", side_effect=subprocess.CalledProcessError(1, "powershell")), \
+             patch("build._wait_until_unlocked") as wait, patch("build.clean") as clean, \
+             patch("build.build_main") as main, patch("builtins.input", return_value=""):
+            self.assertEqual(build.main(), 1)
+        wait.assert_not_called()
+        clean.assert_not_called()
+        main.assert_not_called()
+
+    def test_stop_old_instances_escapes_quote_in_workspace_path(self):
+        root = Path("C:/test's workspace/dist")
+        with patch("build.MAIN_EXE", root / "main.exe"), patch("build.WAKE_EXE", root / "wake.exe"), \
+             patch("build.DIST", root), patch("build.subprocess.run") as run, \
+             patch("build._wait_until_unlocked", return_value=[]):
+            build.kill_old()
+        self.assertIn("test''s workspace", run.call_args.args[0][-1])
+
+    def test_stop_timeout_does_not_start_cleanup(self):
+        import subprocess
+
+        with patch("build.subprocess.run", side_effect=subprocess.TimeoutExpired("powershell", 6)), \
+             patch("build.clean") as clean, patch("builtins.input", return_value=""):
+            self.assertEqual(build.main(), 1)
+        clean.assert_not_called()
+
     def test_single_use_path_iterator_is_checked_on_every_poll(self):
         path = Path("test-only.exe")
         with patch("build._is_locked", return_value=True) as locked, \
