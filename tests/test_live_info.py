@@ -36,42 +36,77 @@ class WeatherServiceTests(unittest.TestCase):
     def response(self, payload):
         return io.BytesIO(json.dumps(payload).encode("utf-8"))
 
+    def located_responses(self, payload, latitude=34.7, longitude=113.6):
+        """定位线索、中文城市名、天气三段响应，供不关心位置名的用例复用。"""
+        return [self.response({"success": True, "city": "Zhengzhou",
+                               "latitude": latitude, "longitude": longitude}),
+                self.response({"results": [{"name": "郑州",
+                                            "latitude": latitude, "longitude": longitude}]}),
+                self.response(payload)]
+
     def test_device_position_and_zero_temperature(self):
         position = subprocess.CompletedProcess([], 0, '{"latitude":0,"longitude":0}')
-        geocode = self.response({"city": "郑州市"})
         with patch.object(live_info.subprocess, "run", return_value=position), \
-             patch.object(live_info, "urlopen", side_effect=[geocode, self.response(self.payload)]) as network:
+             patch.object(live_info, "urlopen", side_effect=self.located_responses(self.payload, 0, 0)) as network:
             result = live_info.fetch_weather()
         self.assertEqual(result.display(self.now), "0℃  晴")
         self.assertEqual(result.source, "设备定位")
+        self.assertEqual(result.location, "郑州")
         self.assertIn("latitude=0.0", network.call_args.args[0].full_url)
 
     def test_ip_fallback_is_marked(self):
         position = {"success": True, "city": "Zhengzhou", "latitude": 34.7, "longitude": 113.6}
+        match = {"results": [{"name": "郑州", "latitude": 34.75778, "longitude": 113.64861}]}
         with patch.object(live_info.subprocess, "run", side_effect=subprocess.TimeoutExpired("powershell", 12)), \
-             patch.object(live_info, "urlopen", side_effect=[self.response(position), self.response(self.payload)]):
+             patch.object(live_info, "urlopen",
+                          side_effect=[self.response(position), self.response(match), self.response(self.payload)]):
+            result = live_info.fetch_weather()
+        self.assertEqual((result.location, result.source), ("郑州", "IP 近似定位"))
+
+    def test_city_search_mismatch_keeps_service_city(self):
+        """搜索结果与定位坐标不同城时必须放弃，不能把别处的地名安到当前位置上。"""
+        position = {"success": True, "city": "Zhengzhou", "latitude": 34.7, "longitude": 113.6}
+        mismatch = {"results": [{"name": "东京", "latitude": 35.68, "longitude": 139.69}]}
+        with patch.object(live_info.subprocess, "run", side_effect=subprocess.TimeoutExpired("powershell", 12)), \
+             patch.object(live_info, "urlopen",
+                          side_effect=[self.response(position), self.response(mismatch),
+                                       OSError("逆地理不可达"), self.response(self.payload)]), \
+             self.assertLogs("core.live_info", level="WARNING") as diagnostics:
             result = live_info.fetch_weather()
         self.assertEqual((result.location, result.source), ("Zhengzhou", "IP 近似定位"))
+        self.assertIn("不同城", "\n".join(diagnostics.output))
 
-    def test_device_position_is_named_by_reverse_geocode(self):
-        """设备定位只返回坐标，位置名要反查城市，否则界面只剩兜底文案。"""
-        geocode = {"city": "郑州市", "locality": "金水区"}
+    def test_device_position_uses_same_area_ip_city(self):
+        """设备定位只返回坐标，借同城 IP 城市名换中文，否则界面只剩兜底文案。"""
+        ip = {"success": True, "city": "Zhengzhou", "latitude": 34.7, "longitude": 113.6}
+        match = {"results": [{"name": "郑州", "latitude": 34.75778, "longitude": 113.64861}]}
         with patch.object(live_info, "_powershell_json", return_value={"latitude": 34.76, "longitude": 113.74}), \
-             patch.object(live_info, "_read_json", side_effect=[geocode, self.payload]) as network:
+             patch.object(live_info, "_read_json", side_effect=[ip, match, self.payload]) as network:
             result = live_info.fetch_weather()
-        self.assertEqual((result.location, result.source), ("郑州市", "设备定位"))
-        self.assertIn("localityLanguage=zh", network.call_args_list[0].args[0])
+        self.assertEqual((result.location, result.source), ("郑州", "设备定位"))
+        self.assertIn("language=zh", network.call_args_list[1].args[0])
 
-    def test_reverse_geocode_failure_keeps_placeholder_location(self):
-        """反查失败或没有城市字段时必须回退兜底文案，而且不能静默降级。"""
-        for geocode in (OSError("定位服务不可达"), ValueError("服务返回的数据格式无效"), {}, {"city": "   "}):
-            with self.subTest(geocode=geocode), \
+    def test_unresolved_city_falls_back_to_placeholder(self):
+        """取名线索和逆地理都失败时回退兜底文案，而且不能静默降级。"""
+        samples = (OSError("定位服务不可达"), ValueError("服务返回的数据格式无效"),
+                   {}, {"success": False, "message": "reserved range"})
+        for sample in samples:
+            with self.subTest(sample=sample), \
                  patch.object(live_info, "_powershell_json", return_value={"latitude": 34.76, "longitude": 113.74}), \
-                 patch.object(live_info, "_read_json", side_effect=[geocode, self.payload]), \
+                 patch.object(live_info, "_read_json", side_effect=[sample, OSError("逆地理不可达"), self.payload]), \
                  self.assertLogs("core.live_info", level="WARNING") as diagnostics:
                 result = live_info.fetch_weather()
             self.assertEqual((result.location, result.source), ("当前位置", "设备定位"))
             self.assertIn("逆地理", "\n".join(diagnostics.output))
+
+    def test_service_city_is_last_resort_when_name_lookup_fails(self):
+        """有定位服务原名时不能掉到兜底文案：搜索和逆地理都失败也要留住它。"""
+        ip = {"success": True, "city": "Zhengzhou", "latitude": 34.7, "longitude": 113.6}
+        with patch.object(live_info, "_powershell_json", return_value={"latitude": 34.76, "longitude": 113.74}), \
+             patch.object(live_info, "_read_json",
+                          side_effect=[ip, OSError("搜索不可达"), OSError("逆地理不可达"), self.payload]):
+            result = live_info.fetch_weather()
+        self.assertEqual((result.location, result.source), ("Zhengzhou", "设备定位"))
 
     def test_rejects_invalid_weather_and_stale_values(self):
         position = subprocess.CompletedProcess([], 0, '{"latitude":34.7,"longitude":113.6}')
@@ -81,8 +116,7 @@ class WeatherServiceTests(unittest.TestCase):
             with self.subTest(key=key, value=value):
                 payload = {**self.payload, "current": {**self.payload["current"], key: value}}
                 with patch.object(live_info.subprocess, "run", return_value=position), \
-                     patch.object(live_info, "urlopen",
-                                 side_effect=[self.response({"city": "郑州市"}), self.response(payload)]):
+                     patch.object(live_info, "urlopen", side_effect=self.located_responses(payload)):
                     with self.assertRaises(ValueError):
                         live_info.fetch_weather()
 

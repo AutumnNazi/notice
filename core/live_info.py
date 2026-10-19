@@ -23,8 +23,12 @@ _LOGGER = get_logger(__name__)
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 LOCATION_URL = "https://ipwho.is/"
-# 设备定位只给坐标，靠免费逆地理服务换城市名，该接口无需密钥。
+# 定位服务只给拼音或英文城市名，用与天气同源的地理编码接口换中文名。
+CITY_SEARCH_URL = "https://geocoding-api.open-meteo.com/v1/search"
+# 设备定位只给坐标，靠免费逆地理服务补地名；该接口国内可达性差，只作最后手段。
 REVERSE_GEOCODE_URL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
+# 搜索结果与定位坐标的同城容差，避免代理或 VPN 下把别处地名安到当前位置上。
+CITY_MATCH_DEGREES = 0.5
 WEATHER_REFRESH_SECONDS = 600
 WEATHER_RETRY_SECONDS = 60
 LUNAR_RETRY_SECONDS = 60
@@ -131,6 +135,60 @@ def _reverse_geocode(latitude: float, longitude: float) -> str:
     return city
 
 
+def _search_city_in_chinese(name: str, latitude: float, longitude: float) -> str:
+    # 定位服务给的是拼音或英文，借与天气同源的地理编码接口换成中文名
+    query = urlencode({"name": name, "count": 1, "language": "zh", "format": "json"})
+    try:
+        data = _read_json(f"{CITY_SEARCH_URL}?{query}")
+    except (OSError, ValueError) as exc:
+        _LOGGER.warning("城市名搜索失败，保留定位服务原名：url=%s %s: %s",
+                        CITY_SEARCH_URL, type(exc).__name__, exc)
+        return ""
+    results = data.get("results")
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+        _LOGGER.warning("城市名搜索没有可用结果，保留定位服务原名：url=%s 名称=%s",
+                        CITY_SEARCH_URL, name)
+        return ""
+    found = results[0]
+    try:
+        found_latitude = _coordinate(found.get("latitude"), 90)
+        found_longitude = _coordinate(found.get("longitude"), 180)
+    except ValueError as exc:
+        _LOGGER.warning("城市名搜索返回了无效坐标，保留定位服务原名：url=%s %s: %s",
+                        CITY_SEARCH_URL, type(exc).__name__, exc)
+        return ""
+    if abs(found_latitude - latitude) > CITY_MATCH_DEGREES or abs(found_longitude - longitude) > CITY_MATCH_DEGREES:
+        # 代理或 VPN 会让 IP 城市名落到别处，这种名字比原名更容易误导用户
+        _LOGGER.warning("城市名搜索结果与定位坐标不同城，保留定位服务原名：名称=%s 搜索=(%.2f, %.2f) 定位=(%.2f, %.2f)",
+                        name, found_latitude, found_longitude, latitude, longitude)
+        return ""
+    return str(found.get("name") or "").strip()
+
+
+def _ip_service_city() -> str:
+    # 设备定位不返回地名，借 IP 定位的城市名当取名线索
+    try:
+        position = _read_json(LOCATION_URL)
+    except (OSError, ValueError) as exc:
+        _LOGGER.warning("IP 定位补名失败，改用坐标反查地名：url=%s %s: %s",
+                        LOCATION_URL, type(exc).__name__, exc)
+        return ""
+    if position.get("success") is not True:
+        _LOGGER.warning("IP 定位补名未返回成功结果，改用坐标反查地名：url=%s 提示=%s",
+                        LOCATION_URL, position.get("message") or "-")
+        return ""
+    return str(position.get("city") or position.get("region") or "").strip()
+
+
+def _localized_city(latitude: float, longitude: float, service_city: str = "") -> str:
+    # 位置名统一成中文：先换名，换不到再按坐标反查，最后才落到兜底文案
+    if service_city:
+        chinese = _search_city_in_chinese(service_city, latitude, longitude)
+        if chinese:
+            return chinese
+    return _reverse_geocode(latitude, longitude) or service_city or "当前位置"
+
+
 def fetch_weather() -> Weather:
     # Windows 位置服务无数据时使用 IP 近似定位，界面明确区分两种来源。
     try:
@@ -146,8 +204,8 @@ try {
 """)
         latitude = _coordinate(position.get("latitude"), 90)
         longitude = _coordinate(position.get("longitude"), 180)
-        city = _reverse_geocode(latitude, longitude)
-        location, source = city or "当前位置", "设备定位"
+        service_city = _ip_service_city()
+        location, source = _localized_city(latitude, longitude, service_city), "设备定位"
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         # 降级路径：记录异常类型与原因，便于判断是位置权限、服务缺失还是系统报错
         _LOGGER.warning("设备定位不可用，改用 IP 近似定位：%s: %s", type(exc).__name__, exc)
@@ -158,8 +216,8 @@ try {
             raise ValueError("自动定位失败，请检查网络或位置权限")
         latitude = _coordinate(position.get("latitude"), 90)
         longitude = _coordinate(position.get("longitude"), 180)
-        location = str(position.get("city") or position.get("region") or "当前位置")
-        source = "IP 近似定位"
+        service_city = str(position.get("city") or position.get("region") or "")
+        location, source = _localized_city(latitude, longitude, service_city), "IP 近似定位"
     query = urlencode({
         "latitude": latitude, "longitude": longitude,
         "current": "temperature_2m,weather_code,is_day", "temperature_unit": "celsius",
