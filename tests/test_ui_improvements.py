@@ -236,6 +236,74 @@ class EmptyListCopyTests(_RealAppTests):
                     trigger_type="weekly", trigger_config={"weekdays": [0], "hour": 9})
 
 
+class LightweightFilterTests(_RealAppTests):
+    """关键词/筛选只切换既有卡片的显隐，重新可见的提醒不能漏渲染。"""
+
+    def _task(self, task_id: str, title: str) -> Task:
+        return Task(id=task_id, title=title, body="正文",
+                    trigger_type="weekly", trigger_config={"weekdays": [0], "hour": 9})
+
+    def _search(self, keyword: str) -> None:
+        self.app.search_var.set(keyword)
+        self.app._on_search_changed()
+        self.app._run_search_filter()
+        self.app.root.update()
+
+    def test_task_hidden_at_last_full_render_gets_a_card_when_it_becomes_visible(self):
+        self.app.tasks = [self._task("a", "会议纪要"), self._task("b", "喝水")]
+        self.app._refresh_ui()
+        self.app.root.update()
+
+        self._search("会议")
+        self.assertEqual([task.id for task in self.app._visible_tasks()], ["a"])
+
+        # 搜索期间新建了一条不匹配关键词的提醒：整批重建不会为它建卡片。
+        self.app.tasks.append(self._task("c", "买咖啡"))
+        self.app._refresh_ui()
+        self.app.root.update()
+        self.assertNotIn("c", self.app.task_cards)
+
+        self._search("")
+        self.assertEqual([task.id for task in self.app._visible_tasks()], ["a", "b", "c"])
+        self.assertEqual(self.app.summary_var.get(), "共 3 条提醒")
+        for task_id in ("a", "b", "c"):
+            card = self.app.task_cards.get(task_id)
+            self.assertIsNotNone(card, f"清空关键词后 {task_id} 少了卡片")
+            self.assertTrue(card.grid_info(), f"清空关键词后 {task_id} 的卡片没有显示")
+        rows = [int(self.app.task_cards[task_id].grid_info()["row"]) for task_id in ("a", "b", "c")]
+        self.assertEqual(rows, [0, 1, 2])
+
+    def test_typing_is_debounced_and_escape_clears_without_full_rebuild(self):
+        self.app.tasks = [self._task("a", "会议纪要"), self._task("b", "喝水")]
+        self.app._refresh_ui()
+        self.app.root.update()
+
+        with patch.object(self.app, "_apply_filter") as light:
+            self.app.search_var.set("会议")
+            light.assert_not_called()
+            deadline = time.monotonic() + 3
+            while not light.called and time.monotonic() < deadline:
+                self.app.root.update()
+                time.sleep(0.02)
+            self.assertTrue(light.called, "输入停顿之后没有触发筛选")
+
+        field = self.app.search_entry
+        # 窗口没被激活时 focus_set 只是请求，按键事件仍投不到输入框；测试要的是真实焦点。
+        field.focus_force()
+        self.app.root.update()
+        with patch.object(self.app, "_refresh_ui") as full:
+            field.tk.call("event", "generate", field, "<KeyPress-Escape>")
+            self.app.root.update()
+            self.assertEqual(self.app.search_var.get(), "", "Esc 没有清空搜索框")
+            deadline = time.monotonic() + 3
+            while len(self.app._visible_tasks()) != 2 and time.monotonic() < deadline:
+                self.app.root.update()
+                time.sleep(0.02)
+            self.assertEqual([task.id for task in self.app._visible_tasks()], ["a", "b"],
+                             "Esc 之后没有按空关键词重新筛选")
+            full.assert_not_called()
+
+
 class PauseButtonTests(_RealAppTests):
     """暂停按钮显示“点下去会发生什么”，与托盘措辞一致，且与点击行为相符。"""
 
@@ -1213,6 +1281,56 @@ class CoreRegressionTests(unittest.TestCase):
             scheduler._scheduler.modify_job(edited.id, next_run_time=datetime.now(retry.next_run_time.tzinfo))
             self.assertTrue(completed.wait(3))
             self.assertEqual(scheduler.notifier.send.call_count, 2)
+        finally:
+            release.set()
+            scheduler.shutdown()
+
+    def test_skipped_weekly_workday_is_rearmed_instead_of_being_lost(self):
+        from apscheduler.events import EVENT_JOB_MAX_INSTANCES
+
+        entered, release, skipped = Event(), Event(), Event()
+        scheduler = TaskScheduler(MagicMock())
+        schedule_at = {"value": datetime.now().astimezone() + timedelta(seconds=0.2)}
+
+        def send(_task):
+            entered.set()
+            release.wait(5)
+
+        scheduler.notifier.send.side_effect = send
+        scheduler._scheduler.add_listener(lambda _event: skipped.set(), EVENT_JOB_MAX_INSTANCES)
+        scheduler.start()
+        try:
+            with patch.object(scheduler, "_next_weekly_last_workday",
+                              side_effect=lambda *args, **kwargs: schedule_at["value"]):
+                task = Task(id="busy-weekly", title="写周报", trigger_type="weekly_last_workday",
+                            trigger_config={"hour": 18})
+                scheduler.upsert_task(task)
+                self.assertTrue(entered.wait(3), "第一次触发没有真的跑起来")
+                # 上一次还没跑完时又到点：调度器跳过这次触发并把它从存储里删掉。
+                schedule_at["value"] = datetime.now().astimezone() + timedelta(seconds=0.3)
+                scheduler._schedule_task(task)
+                self.assertTrue(skipped.wait(3), "没有等到执行槽占满的跳过事件")
+                deadline = time.monotonic() + 3
+                while scheduler._scheduler.get_job(task.id) is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                retry = scheduler._scheduler.get_job(task.id)
+                self.assertIsNotNone(retry, "按周的最后工作日被跳过后不能永久丢失")
+                self.assertIs(retry.args[1], task)
+                self.assertIsNone(task.retry_at, "周期提醒不该占用只属于单次提醒的 retry_at")
+                self.assertEqual(task.next_run, retry.next_run_time.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+                # 补发跑完要回到下一周的正规排程，而不是继续按分钟重试。
+                schedule_at["value"] = datetime.now().astimezone() + timedelta(days=7)
+                release.set()
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    job = scheduler._scheduler.get_job(task.id)
+                    if job is not None and job.next_run_time >= schedule_at["value"] - timedelta(seconds=1):
+                        break
+                    time.sleep(0.02)
+                job = scheduler._scheduler.get_job(task.id)
+                self.assertIsNotNone(job)
+                self.assertGreaterEqual(job.next_run_time, schedule_at["value"] - timedelta(seconds=1),
+                                        "补发之后没有回到下一周的正规排程")
         finally:
             release.set()
             scheduler.shutdown()

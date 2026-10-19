@@ -11,6 +11,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import winreg
+from collections import OrderedDict
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -38,6 +39,11 @@ from store import TaskStore
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SEARCH_PLACEHOLDER = "搜索标题、内容或周期..."
+# 搜索每敲一个键就整批重建列表会让输入卡住：输入停顿这么久才真正筛一次。
+SEARCH_DEBOUNCE_MS = 150
+# 首页插画只保留最近用过的几种尺寸：拖动窗口会连续产生新尺寸，缓存与保活列表都得有上限，
+# 否则每跨过一次尺寸边界就多留一张整幅 PhotoImage（实测 4 态 50 轮多留 26.6 MiB）。
+BOAT_ART_CACHE_LIMIT = 4
 
 
 class NoticeApp:
@@ -96,10 +102,14 @@ class NoticeApp:
         self.task_cards: dict[str, tk.Widget] = {}
         self.task_dots: dict[str, tk.Label] = {}
         self.tk_images: list[tk.PhotoImage] = []
+        # 插画与图标按尺寸复用解码结果：同一尺寸反复重绘既不该重复解码，也不该反复占内存。
+        self._boat_photo_cache: OrderedDict[tuple[int, int], tk.PhotoImage] = OrderedDict()
+        self._icon_photo_cache: dict[int, tk.PhotoImage] = {}
         self.empty_label: tk.Label | None = None
         self.pause_button: PillButton | None = None
         self.scroll_frame: tk.Frame | None = None
         self.search_entry: tk.Entry | None = None
+        self._search_placeholder: tk.Label | None = None
         self.filter_btn: tk.Label | None = None
         # 两类菜单都只建一次、反复复用：每次弹出都新建会让 Tcl widget 随点击次数线性增长。
         self._task_menu: tk.Menu | None = None
@@ -111,6 +121,9 @@ class NoticeApp:
         # 需要在滚动范围重算之后带进视野的卡片，以及上次已经带过的选中项。
         self._pending_into_view: str | None = None
         self._last_scrolled_selection: str | None = None
+        # 卡片上实际画出的选中项：调用方可能先改 selected_task_id 再要求筛选，
+        # 只有这个字段才等于「界面上现在高亮的是谁」。
+        self._rendered_selection: str | None = None
         self.shell: tk.Frame | None = None
         self.left_panel: tk.Frame | None = None
         self.home_intro_content: tk.Frame | None = None
@@ -127,7 +140,11 @@ class NoticeApp:
         self.home_art_size: tuple[int, int] | None = None
 
         self._configure_styles()
-        self.search_var.trace_add("write", lambda *_args: self._refresh_ui())
+        # 搜索输入只按最后一次停顿筛一次，句柄留着以便取消上一次；重复写入直接跳过。
+        self._search_after_id: str | None = None
+        self._search_keyword = ""
+        self._search_focused = False
+        self.search_var.trace_add("write", lambda *_args: self._on_search_changed())
         self.tray = TrayController(
             on_open=self.show_window,
             on_add_task=self.add_task_from_tray,
@@ -272,11 +289,14 @@ class NoticeApp:
         self.pause_button = None
         self.scroll_frame = None
         self.search_entry = None
+        self._search_placeholder = None
+        self._search_focused = False
         self.filter_btn = None
         self.task_canvas = None
         self.task_scrollbar = None
         # 重建后按新尺寸把当前选中项重新带进视野一次。
         self._last_scrolled_selection = None
+        self._rendered_selection = None
         self.shell = None
         self.left_panel = None
         self.home_intro_content = None
@@ -341,6 +361,9 @@ class NoticeApp:
             pass
 
     def _load_icon_photo(self, target_size: int) -> tk.PhotoImage | None:
+        cached = self._icon_photo_cache.get(target_size)
+        if cached is not None:
+            return cached
         candidates = sorted(ICON_PNG_FILES, key=lambda path: abs(int(path.stem.rsplit("_", 1)[-1]) - target_size))
         for path in candidates:
             if not path.exists():
@@ -349,6 +372,7 @@ class NoticeApp:
                 image = tk.PhotoImage(master=self.root, file=str(path))
             except tk.TclError:
                 continue
+            self._icon_photo_cache[target_size] = image
             self.tk_images.append(image)
             return image
         return None
@@ -409,8 +433,6 @@ class NoticeApp:
         )
         search_box.grid(row=0, column=0, sticky="ew")
         search_box.content.grid_columnconfigure(1, weight=1)
-        if not self.search_var.get().strip():
-            self.search_var.set(SEARCH_PLACEHOLDER)
         tk.Label(
             search_box.content,
             text="⌕",
@@ -422,7 +444,7 @@ class NoticeApp:
             search_box.content,
             textvariable=self.search_var,
             bg=PALETTE.card_bg,
-            fg=PALETTE.text_muted if self.search_var.get() in (SEARCH_PLACEHOLDER, "搜索提醒") else PALETTE.text_primary,
+            fg=PALETTE.text_primary if self.search_var.get().strip() else PALETTE.text_muted,
             insertbackground=PALETTE.text_primary,
             relief="flat",
             highlightthickness=0,
@@ -440,8 +462,23 @@ class NoticeApp:
         )
         self.filter_btn.grid(row=0, column=2, sticky="e", padx=(scale(8, self.ui_scale), scale(2, self.ui_scale)))
         self.filter_btn.bind("<Button-1>", lambda _event: self._open_filter_menu(self.filter_btn))
+        # 占位提示单独放一个叠加标签：写进搜索变量会连带触发一次搜索刷新，
+        # 而聚焦、失焦这种纯显示变化不该影响筛选结果。标签建在输入框之后，因此叠在它上面，
+        # 点它等同于点输入框。
+        self._search_placeholder = tk.Label(
+            search_box.content,
+            text=SEARCH_PLACEHOLDER,
+            bg=PALETTE.card_bg,
+            fg=PALETTE.text_muted,
+            font=font(self.font_family_var.get(), 10, self.ui_scale),
+            cursor="xterm",
+        )
+        self._search_placeholder.grid(row=0, column=1, sticky="w")
+        self._search_placeholder.bind("<Button-1>", self._focus_search_entry)
         self.search_entry.bind("<FocusIn>", self._search_focus_in)
         self.search_entry.bind("<FocusOut>", self._search_focus_out)
+        self.search_entry.bind("<Escape>", self._clear_search)
+        self._sync_search_placeholder()
 
         list_shell = tk.Frame(left, bg=PALETTE.card_bg, padx=scale(22, self.ui_scale), pady=scale(6, self.ui_scale))
         list_shell.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(scale(16, self.ui_scale), 0))
@@ -837,26 +874,15 @@ class NoticeApp:
         self.task_cards.clear()
         self.task_dots.clear()
 
-        if self.selected_task_id and not any(task.id == self.selected_task_id for task in self.tasks):
-            self.selected_task_id = None
-        if not self.selected_task_id and self.tasks:
-            self.selected_task_id = self.tasks[0].id
-
         filtered_tasks = self._visible_tasks()
-
-        if self.selected_task_id and not any(task.id == self.selected_task_id for task in filtered_tasks):
-            self.selected_task_id = filtered_tasks[0].id if filtered_tasks else None
-        if not self.selected_task_id and filtered_tasks:
-            self.selected_task_id = filtered_tasks[0].id
+        self._resolve_selection(filtered_tasks)
 
         for index, task in enumerate(filtered_tasks):
             self._render_task_card(task, index)
+        self._rendered_selection = self.selected_task_id
 
         enabled_count = sum(1 for task in self.tasks if task.enabled)
-        if len(filtered_tasks) != len(self.tasks):
-            self.summary_var.set(f"筛选 {len(filtered_tasks)}/{len(self.tasks)} 条")
-        else:
-            self.summary_var.set(f"共 {len(self.tasks)} 条提醒")
+        self._sync_list_after_render(filtered_tasks)
         self.subtitle_var.set(f"{APP_NAME} · 静水深流，按时而渡")
         if self.pause_button:
             # 按钮写“点下去会发生什么”，与托盘菜单的措辞保持一致；当前是运行还是暂停交给圆点颜色表达，
@@ -883,6 +909,28 @@ class NoticeApp:
             self.filter_btn.configure(
                 fg=PALETTE.accent_text if self.filter_type != "all" else PALETTE.text_secondary
             )
+
+    def _resolve_selection(self, filtered_tasks: list[Task]) -> None:
+        """收敛选中项：选中的提醒被删掉或被筛选挡掉时退到第一条可见提醒。
+
+        整批重建与轻量筛选都走这里：两条路径必须落到同一个选中项，
+        否则同一组关键词下先点搜索和先切筛选会高亮不同的卡片。
+        """
+        if self.selected_task_id and not any(task.id == self.selected_task_id for task in self.tasks):
+            self.selected_task_id = None
+        if not self.selected_task_id and self.tasks:
+            self.selected_task_id = self.tasks[0].id
+        if self.selected_task_id and not any(task.id == self.selected_task_id for task in filtered_tasks):
+            self.selected_task_id = filtered_tasks[0].id if filtered_tasks else None
+        if not self.selected_task_id and filtered_tasks:
+            self.selected_task_id = filtered_tasks[0].id
+
+    def _sync_list_after_render(self, filtered_tasks: list[Task]) -> None:
+        """列表渲染之后的公共收尾：条数文案、空状态、带入视野与滚动范围。"""
+        if len(filtered_tasks) != len(self.tasks):
+            self.summary_var.set(f"筛选 {len(filtered_tasks)}/{len(self.tasks)} 条")
+        else:
+            self.summary_var.set(f"共 {len(self.tasks)} 条提醒")
         if self.empty_label:
             if filtered_tasks:
                 self.empty_label.place_forget()
@@ -899,9 +947,50 @@ class NoticeApp:
         if self.selected_task_id and self.selected_task_id != self._last_scrolled_selection:
             self._last_scrolled_selection = self.selected_task_id
             self._pending_into_view = self.selected_task_id
-        # 这一轮卡片数量可能变了，滚动范围要跟着重新算，否则会停在旧内容高度上。
+        # 卡片显隐或数量变了，滚动范围要跟着重新算，否则会停在旧内容高度上。
         self._schedule_scroll_sync()
         self.tray.refresh()
+
+    def _apply_filter(self) -> None:
+        """关键词或筛选变化时只切换既有卡片的显隐，不整批销毁重建。
+
+        卡片内容只跟提醒自身的状态有关，筛选不会改变它；而整批重建 50 条实测要 3 秒左右，
+        搜索每敲一个键都走那条路径会让输入整段卡住。选中项跟着筛选结果变化时，
+        只按同一份渲染代码重建受影响的那两张卡片，高亮不靠就地改色、不会漏掉某一层。
+        """
+        if not self.scroll_frame:
+            return
+        previous_selection = self._rendered_selection
+        filtered_tasks = self._visible_tasks()
+        self._resolve_selection(filtered_tasks)
+        visible_ids = [task.id for task in filtered_tasks]
+        if self.selected_task_id != previous_selection:
+            for task_id in (previous_selection, self.selected_task_id):
+                if task_id is None or self.task_cards.get(task_id) is None:
+                    continue
+                task = next((item for item in self.tasks if item.id == task_id), None)
+                self.task_cards.pop(task_id).destroy()
+                if task is not None:
+                    self._render_task_card(task, visible_ids.index(task_id) if task_id in visible_ids else 0)
+        self._rendered_selection = self.selected_task_id
+        visible_set = set(visible_ids)
+        for index, task_id in enumerate(visible_ids):
+            card = self.task_cards.get(task_id)
+            if card is None:
+                # 上次整批重建时这条被筛掉了，卡片根本不存在；这里要补渲染，
+                # 否则搜索期间新建的提醒在清空关键词后不显示，条数却按全集算。
+                task = next((item for item in self.tasks if item.id == task_id), None)
+                if task is not None:
+                    self._render_task_card(task, index)
+                continue
+            hidden = not card.grid_info()
+            card.grid_configure(row=index)
+            if hidden:
+                card.grid()
+        for task_id, card in self.task_cards.items():
+            if task_id not in visible_set and card.grid_info():
+                card.grid_remove()
+        self._sync_list_after_render(filtered_tasks)
 
     def _refresh_clock(self) -> None:
         # 每次读取系统时间，跨日、休眠恢复和校时后都显示当前值。
@@ -1199,6 +1288,8 @@ class NoticeApp:
 
     def _draw_boat_art(self, canvas: tk.Canvas) -> None:
         canvas.update_idletasks()
+        # 资产缺失时的回退路径同样要先清空：尺寸来回切换会在同一张画布上叠加旧图元。
+        canvas.delete("all")
         width = max(int(canvas["width"]), 260)
         height = max(int(canvas["height"]), 120)
         mountain = "#e9e7e2"
@@ -1248,24 +1339,44 @@ class NoticeApp:
     def _draw_boat_asset(self, canvas: tk.Canvas) -> bool:
         if not BOAT_ART_FILE.exists():
             return False
-        try:
-            image = Image.open(BOAT_ART_FILE).convert("RGBA")
-        except OSError:
-            return False
         canvas_width = max(1, int(float(canvas["width"])))
         canvas_height = max(1, int(float(canvas["height"])))
-        fit_width = max(1, canvas_width - scale(16, self.ui_scale))
-        fit_height = max(1, canvas_height - scale(12, self.ui_scale))
-        image.thumbnail((fit_width, fit_height), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(image, master=self.root)
-        self.tk_images.append(photo)
+        size = (canvas_width, canvas_height)
+        photo = self._boat_photo_cache.get(size)
+        if photo is None:
+            try:
+                image = Image.open(BOAT_ART_FILE).convert("RGBA")
+            except OSError:
+                return False
+            fit_width = max(1, canvas_width - scale(16, self.ui_scale))
+            fit_height = max(1, canvas_height - scale(12, self.ui_scale))
+            image.thumbnail((fit_width, fit_height), Image.Resampling.LANCZOS)
+            photo = self._cache_boat_photo(size, ImageTk.PhotoImage(image, master=self.root))
+        # 命中也要刷新最近使用次序：只按插入顺序淘汰会让来回切换的尺寸每次重新解码。
+        self._boat_photo_cache.move_to_end(size)
         canvas.delete("all")
         canvas.create_image(canvas_width // 2, canvas_height // 2, image=photo, anchor="center")
         return True
 
+    def _cache_boat_photo(self, size: tuple[int, int], photo: tk.PhotoImage) -> tk.PhotoImage:
+        """按尺寸记住插画，并且只保留最近用过的几张。
+
+        解码加缩放一次要上百毫秒，而且都在界面线程里，尺寸来回切换时必须复用；
+        但拖动窗口会连续产生新尺寸，缓存不设上限就等价于没缓存。被挤掉的那张已经不在
+        画布上，所以同时从保活列表里摘掉，让 tk_images 不再随尺寸数量增长。
+        """
+        self._boat_photo_cache[size] = photo
+        self._boat_photo_cache.move_to_end(size)
+        self.tk_images.append(photo)
+        while len(self._boat_photo_cache) > BOAT_ART_CACHE_LIMIT:
+            _stale_size, stale_photo = self._boat_photo_cache.popitem(last=False)
+            if stale_photo in self.tk_images:
+                self.tk_images.remove(stale_photo)
+        return photo
+
     def _select_task(self, task_id: str) -> None:
         self.selected_task_id = task_id
-        self._refresh_ui()
+        self._apply_filter()
 
     def _schedule_scroll_sync(self) -> None:
         # frame 的 <Configure> 在布局刷新之前就触发，此刻读到的还是旧高度，
@@ -1421,21 +1532,54 @@ class NoticeApp:
             self.filter_btn.configure(
                 fg=PALETTE.accent_text if filter_type != "all" else PALETTE.text_secondary
             )
-        self._refresh_ui()
+        self._apply_filter()
+
+    def _focus_search_entry(self, _event=None) -> None:
+        if self.search_entry is not None:
+            self.search_entry.focus_set()
 
     def _search_focus_in(self, _event) -> None:
-        if self.search_entry is None:
-            return
-        if self.search_var.get() in (SEARCH_PLACEHOLDER, "搜索提醒"):
-            self.search_var.set("")
-        self.search_entry.configure(fg=PALETTE.text_primary)
+        # 聚焦、失焦只切占位提示与字色：写变量会连带触发一次搜索刷新，纯属白干。
+        self._search_focused = True
+        self._sync_search_placeholder()
 
     def _search_focus_out(self, _event) -> None:
-        if self.search_entry is None:
+        self._search_focused = False
+        self._sync_search_placeholder()
+
+    def _sync_search_placeholder(self) -> None:
+        show = not self.search_var.get().strip() and not self._search_focused
+        if self._search_placeholder is not None:
+            if show:
+                self._search_placeholder.grid()
+            else:
+                self._search_placeholder.grid_remove()
+        if self.search_entry is not None:
+            self.search_entry.configure(fg=PALETTE.text_muted if show else PALETTE.text_primary)
+
+    def _on_search_changed(self) -> None:
+        keyword = self.search_var.get()
+        if keyword == self._search_keyword:
             return
-        if not self.search_var.get().strip():
-            self.search_var.set(SEARCH_PLACEHOLDER)
-            self.search_entry.configure(fg=PALETTE.text_muted)
+        self._search_keyword = keyword
+        self._sync_search_placeholder()
+        if self._search_after_id is not None:
+            try:
+                self.root.after_cancel(self._search_after_id)
+            except tk.TclError:
+                pass
+        self._search_after_id = self.root.after(SEARCH_DEBOUNCE_MS, self._run_search_filter)
+
+    def _run_search_filter(self) -> None:
+        self._search_after_id = None
+        self._apply_filter()
+
+    def _clear_search(self, _event=None) -> str:
+        """Esc 清空关键词；焦点留在输入框，方便直接重敲。"""
+        self.search_var.set("")
+        if self.search_entry is not None:
+            self.search_entry.focus_set()
+        return "break"
 
     def _task_icon(self, task: Task) -> str:
         mapping = {

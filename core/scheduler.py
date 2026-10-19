@@ -222,21 +222,34 @@ class TaskScheduler:
         task.next_run = self.task_next_run(task.id)
 
     def _on_job_skipped(self, event) -> None:
-        """执行槽被上一次还没跑完的调用占满时，给已到点的单次提醒补一次延迟重试。
+        """执行槽被上一次还没跑完的调用占满时，把已到点的提醒重新排上。
 
-        APScheduler 跳过这次触发后，会按「单次 job 没有下一次触发时间」把它从存储里删掉，
-        用户刚编辑好的提醒就此永久消失；这里按既有的 retry_at 语义重新排一次，
-        重启后仍能从 retry_at 恢复。周期 job 跳过时下一轮照常触发，不需要也不应该在这里补。
+        APScheduler 跳过这次触发后，会按「这次触发之后没有下一次触发时间」把 job 从存储里删掉：
+        单次提醒会就此永久消失，按周的最后工作日则是整周不再提醒。这里统一补一次延迟重试——
+        单次提醒走既有的 retry_at 语义重新排一次，重启后仍能从 retry_at 恢复；
+        按周的最后工作日补发一次，跑完由 _run_task 排回下一周。
+        interval / weekly 这类自带下一次触发时间的 job 不受影响，不在这里补。
         """
         with self._lock:
             task = self._tasks.get(event.job_id)
             # 已被删除、停用或再次编辑过（调度器里已有新 job）时不复活旧提醒、不覆盖新配置。
-            if (task is None or not task.enabled or task.trigger_type != "once" or self._stopping
+            if (task is None or not task.enabled or self._stopping
+                    or task.trigger_type not in {"once", "weekly_last_workday"}
                     or self._scheduler.get_job(task.id) is not None):
                 return
-            task.retry_at = (datetime.now().astimezone()
-                             + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)).isoformat()
-            self._schedule_task(task)
+            if task.trigger_type == "once":
+                task.retry_at = (datetime.now().astimezone()
+                                 + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)).isoformat()
+                self._schedule_task(task)
+            else:
+                # retry_at 只允许单次提醒持有（validate 会把其它类型判成坏记录），周期提醒
+                # 不占用它：重启时按配置重算即可，不需要额外的持久化字段。
+                self._scheduler.add_job(
+                    self._run_task,
+                    DateTrigger(run_date=datetime.now().astimezone() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)),
+                    id=task.id, args=[task.id, task], replace_existing=True, misfire_grace_time=None,
+                )
+                task.next_run = self.task_next_run(task.id)
         self._notify_changed()
 
     def _notify(self, task_id: str, *, expected: Task | None = None) -> Task | None:
