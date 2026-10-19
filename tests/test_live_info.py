@@ -38,8 +38,9 @@ class WeatherServiceTests(unittest.TestCase):
 
     def test_device_position_and_zero_temperature(self):
         position = subprocess.CompletedProcess([], 0, '{"latitude":0,"longitude":0}')
+        geocode = self.response({"city": "郑州市"})
         with patch.object(live_info.subprocess, "run", return_value=position), \
-             patch.object(live_info, "urlopen", return_value=self.response(self.payload)) as network:
+             patch.object(live_info, "urlopen", side_effect=[geocode, self.response(self.payload)]) as network:
             result = live_info.fetch_weather()
         self.assertEqual(result.display(self.now), "0℃  晴")
         self.assertEqual(result.source, "设备定位")
@@ -52,6 +53,26 @@ class WeatherServiceTests(unittest.TestCase):
             result = live_info.fetch_weather()
         self.assertEqual((result.location, result.source), ("Zhengzhou", "IP 近似定位"))
 
+    def test_device_position_is_named_by_reverse_geocode(self):
+        """设备定位只返回坐标，位置名要反查城市，否则界面只剩兜底文案。"""
+        geocode = {"city": "郑州市", "locality": "金水区"}
+        with patch.object(live_info, "_powershell_json", return_value={"latitude": 34.76, "longitude": 113.74}), \
+             patch.object(live_info, "_read_json", side_effect=[geocode, self.payload]) as network:
+            result = live_info.fetch_weather()
+        self.assertEqual((result.location, result.source), ("郑州市", "设备定位"))
+        self.assertIn("localityLanguage=zh", network.call_args_list[0].args[0])
+
+    def test_reverse_geocode_failure_keeps_placeholder_location(self):
+        """反查失败或没有城市字段时必须回退兜底文案，而且不能静默降级。"""
+        for geocode in (OSError("定位服务不可达"), ValueError("服务返回的数据格式无效"), {}, {"city": "   "}):
+            with self.subTest(geocode=geocode), \
+                 patch.object(live_info, "_powershell_json", return_value={"latitude": 34.76, "longitude": 113.74}), \
+                 patch.object(live_info, "_read_json", side_effect=[geocode, self.payload]), \
+                 self.assertLogs("core.live_info", level="WARNING") as diagnostics:
+                result = live_info.fetch_weather()
+            self.assertEqual((result.location, result.source), ("当前位置", "设备定位"))
+            self.assertIn("逆地理", "\n".join(diagnostics.output))
+
     def test_rejects_invalid_weather_and_stale_values(self):
         position = subprocess.CompletedProcess([], 0, '{"latitude":34.7,"longitude":113.6}')
         for key, value in (("temperature_2m", None), ("temperature_2m", float("nan")),
@@ -60,7 +81,8 @@ class WeatherServiceTests(unittest.TestCase):
             with self.subTest(key=key, value=value):
                 payload = {**self.payload, "current": {**self.payload["current"], key: value}}
                 with patch.object(live_info.subprocess, "run", return_value=position), \
-                     patch.object(live_info, "urlopen", return_value=self.response(payload)):
+                     patch.object(live_info, "urlopen",
+                                 side_effect=[self.response({"city": "郑州市"}), self.response(payload)]):
                     with self.assertRaises(ValueError):
                         live_info.fetch_weather()
 

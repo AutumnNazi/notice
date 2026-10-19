@@ -23,6 +23,8 @@ _LOGGER = get_logger(__name__)
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 LOCATION_URL = "https://ipwho.is/"
+# 设备定位只给坐标，靠免费逆地理服务换城市名，该接口无需密钥。
+REVERSE_GEOCODE_URL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
 WEATHER_REFRESH_SECONDS = 600
 WEATHER_RETRY_SECONDS = 60
 LUNAR_RETRY_SECONDS = 60
@@ -111,6 +113,24 @@ def _coordinate(value: object, limit: int) -> float:
     return value
 
 
+def _reverse_geocode(latitude: float, longitude: float) -> str:
+    # 设备定位只返回坐标，反查城市名才能让位置名与天气出自同一坐标；查不到交给调用方兜底。
+    query = urlencode({"latitude": latitude, "longitude": longitude, "localityLanguage": "zh"})
+    try:
+        data = _read_json(f"{REVERSE_GEOCODE_URL}?{query}")
+    except (OSError, ValueError) as exc:
+        _LOGGER.warning("逆地理查询失败，位置名改用兜底文案：url=%s %s: %s",
+                        REVERSE_GEOCODE_URL, type(exc).__name__, exc)
+        return ""
+    city = str(data.get("city") or data.get("locality") or "").strip()
+    if not city:
+        # 定位准却显示不出地名，正是静默兜底造成的，这里必须留痕
+        _LOGGER.warning("逆地理未返回城市名，位置名改用兜底文案：url=%s 顶层字段=%s",
+                        REVERSE_GEOCODE_URL, sorted(data.keys()))
+        return ""
+    return city
+
+
 def fetch_weather() -> Weather:
     # Windows 位置服务无数据时使用 IP 近似定位，界面明确区分两种来源。
     try:
@@ -126,7 +146,8 @@ try {
 """)
         latitude = _coordinate(position.get("latitude"), 90)
         longitude = _coordinate(position.get("longitude"), 180)
-        location, source = "当前位置", "设备定位"
+        city = _reverse_geocode(latitude, longitude)
+        location, source = city or "当前位置", "设备定位"
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         # 降级路径：记录异常类型与原因，便于判断是位置权限、服务缺失还是系统报错
         _LOGGER.warning("设备定位不可用，改用 IP 近似定位：%s: %s", type(exc).__name__, exc)

@@ -230,7 +230,12 @@ def main():
         return 1
     finally:
         if sys.stdin is not None and sys.stdin.isatty():
-            input("\n按回车键关闭...")
+            try:
+                input("\n按回车键关闭...")
+            except EOFError:
+                # 句柄被判成终端却读不到输入（被工具或 CI 接管）时不能继续抛，
+                # 否则打包成功也会以非零码退出，掩盖真实结果
+                pass
 
 
 if __name__ == "__main__":

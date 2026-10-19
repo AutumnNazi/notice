@@ -643,6 +643,19 @@ class BuildLockProbeTests(unittest.TestCase):
                 self.assertEqual(build.main(), 0)
             self.assertFalse(backup.exists())
 
+    def test_successful_build_keeps_zero_exit_when_terminal_read_fails(self):
+        """终端被判成可交互却读不到输入时，成功打包不能因为等回车变成非零退出。"""
+        with TemporaryDirectory() as directory:
+            backup = Path(directory) / "preserved"
+            backup.mkdir()
+            with patch("build.PRESERVED_DATA", backup), patch("build.kill_old"), patch("build.clean"), \
+                 patch("build.build_main", return_value=0), patch("build.build_wake", return_value=0), \
+                 patch("build.copy_data"), patch("build.verify", return_value=True), \
+                 patch("build.sys.stdin") as stdin, patch("builtins.input", side_effect=EOFError) as prompt:
+                stdin.isatty.return_value = True
+                self.assertEqual(build.main(), 0)
+            prompt.assert_called_once()
+
     def test_incomplete_build_preserves_backup(self):
         with TemporaryDirectory() as directory:
             backup = Path(directory) / "preserved"
