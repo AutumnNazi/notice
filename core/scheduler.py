@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from threading import RLock
 from typing import Callable, Iterator
 
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.base import STATE_PAUSED
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -53,6 +54,8 @@ class TaskScheduler:
         self._snooze_requests: dict[str, object] = {}
         self._paused = False
         self._stopping = False
+        # 单次 job 到点被跳过时调度器会把它从存储里删掉，只能靠这个事件把它捞回来。
+        self._scheduler.add_listener(self._on_job_skipped, EVENT_JOB_MAX_INSTANCES)
 
     def start(self) -> None:
         self._stopping = False
@@ -217,6 +220,24 @@ class TaskScheduler:
             misfire_grace_time=None if isinstance(trigger, DateTrigger) else 30,
         )
         task.next_run = self.task_next_run(task.id)
+
+    def _on_job_skipped(self, event) -> None:
+        """执行槽被上一次还没跑完的调用占满时，给已到点的单次提醒补一次延迟重试。
+
+        APScheduler 跳过这次触发后，会按「单次 job 没有下一次触发时间」把它从存储里删掉，
+        用户刚编辑好的提醒就此永久消失；这里按既有的 retry_at 语义重新排一次，
+        重启后仍能从 retry_at 恢复。周期 job 跳过时下一轮照常触发，不需要也不应该在这里补。
+        """
+        with self._lock:
+            task = self._tasks.get(event.job_id)
+            # 已被删除、停用或再次编辑过（调度器里已有新 job）时不复活旧提醒、不覆盖新配置。
+            if (task is None or not task.enabled or task.trigger_type != "once" or self._stopping
+                    or self._scheduler.get_job(task.id) is not None):
+                return
+            task.retry_at = (datetime.now().astimezone()
+                             + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)).isoformat()
+            self._schedule_task(task)
+        self._notify_changed()
 
     def _notify(self, task_id: str, *, expected: Task | None = None) -> Task | None:
         """定时触发路径：停用中的提醒不发通知，返回实际通知的任务。

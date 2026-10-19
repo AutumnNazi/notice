@@ -1170,6 +1170,53 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_edited_once_waits_for_busy_executor_slot_instead_of_being_lost(self):
+        from apscheduler.events import EVENT_JOB_MAX_INSTANCES
+
+        entered, release, skipped, completed = Event(), Event(), Event(), Event()
+        scheduler = TaskScheduler(MagicMock())
+
+        def send(task):
+            if task.title == "旧通知":
+                entered.set()
+                release.wait(5)
+            else:
+                completed.set()
+
+        scheduler.notifier.send.side_effect = send
+        scheduler._scheduler.add_listener(lambda _event: skipped.set(), EVENT_JOB_MAX_INSTANCES)
+        scheduler.start()
+        try:
+            when = datetime.now() + timedelta(seconds=0.2)
+            old = Task(id="busy-edited-once", title="旧通知", trigger_type="once",
+                       trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+            scheduler.upsert_task(old)
+            self.assertTrue(entered.wait(3))
+            when = datetime.now() + timedelta(seconds=0.2)
+            edited = Task(id=old.id, title="新通知", trigger_type="once",
+                          trigger_config={"date": when.date().isoformat(), "time": when.time().isoformat()})
+            scheduler.upsert_task(edited)
+            self.assertTrue(skipped.wait(3))
+            deadline = time.monotonic() + 3
+            while scheduler._scheduler.get_job(edited.id) is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            retry = scheduler._scheduler.get_job(edited.id)
+            self.assertIsNotNone(retry, "执行槽占用不能永久丢弃新单次提醒")
+            self.assertIs(retry.args[1], edited)
+            self.assertEqual(retry.max_instances, 1)
+            self.assertIsNotNone(edited.retry_at)
+            release.set()
+            executor = scheduler._scheduler._lookup_executor("default")
+            deadline = time.monotonic() + 3
+            while executor._instances.get(edited.id, 0) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            scheduler._scheduler.modify_job(edited.id, next_run_time=datetime.now(retry.next_run_time.tzinfo))
+            self.assertTrue(completed.wait(3))
+            self.assertEqual(scheduler.notifier.send.call_count, 2)
+        finally:
+            release.set()
+            scheduler.shutdown()
+
     def test_failed_once_retry_survives_save_reload_and_then_succeeds(self):
         with TemporaryDirectory() as directory:
             store = TaskStore(Path(directory) / "tasks.json")
