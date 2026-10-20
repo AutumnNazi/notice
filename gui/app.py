@@ -2051,9 +2051,13 @@ class NoticeApp:
         if self._weather_after_id is not None:
             self.root.after_cancel(self._weather_after_id)
             self._weather_after_id = None
-        self.tray.stop()
-        stop_helper()
-        self.scheduler.shutdown()
+        # 保存成功后逐项清理；某个组件关闭失败不能阻断其余清理。
+        for name, cleanup in (("托盘", self.tray.stop), ("唤醒监听", stop_helper),
+                              ("调度器", self.scheduler.shutdown)):
+            try:
+                cleanup()
+            except Exception:
+                logging.getLogger(__name__).exception("退出时%s关闭失败，继续清理其余组件", name)
         self.root.after(0, self.root.destroy)
 
     def request_exit_app(self) -> None:

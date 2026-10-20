@@ -234,6 +234,36 @@ class ThreadSafeRefreshTests(unittest.TestCase):
         self.app.root.after.call_args.args[1]()
         self.assertEqual(self.calls, ["show"])
 
+    def test_exit_cleanup_failure_still_attempts_remaining_services_and_destroys_window(self):
+        for service in ("tray", "wake", "scheduler"):
+            with self.subTest(service=service):
+                self.app._closing.clear()
+                self.app._clock_after_id = None
+                self.app._weather_after_id = None
+                self.app._ui_request_after_id = None
+                self.app.root.reset_mock()
+                self.app.tray = MagicMock()
+                self.app.scheduler = MagicMock()
+                with patch.object(app_module, "stop_helper") as stop:
+                    if service == "tray":
+                        self.app.tray.stop.side_effect = OSError("托盘关闭失败")
+                    elif service == "wake":
+                        stop.side_effect = OSError("唤醒监听关闭失败")
+                    else:
+                        self.app.scheduler.shutdown.side_effect = OSError("调度器关闭失败")
+                    errors = []
+                    with self.assertLogs("gui.app", level="ERROR") as diagnostics:
+                        try:
+                            self.app.exit_app()
+                        except Exception as exc:
+                            errors.append(exc)
+                        self.assertEqual(errors, [], "组件异常不能中断退出清理")
+                    self.app.tray.stop.assert_called_once()
+                    stop.assert_called_once()
+                    self.app.scheduler.shutdown.assert_called_once()
+                    self.app.root.after.assert_called_once_with(0, self.app.root.destroy)
+                    self.assertIn("关闭失败", "\n".join(diagnostics.output))
+
     def test_drain_applies_pending_worker_refresh_exactly_once(self):
         for _ in range(3):
             worker = threading.Thread(target=self.app._schedule_refresh, name="scheduler-worker")
