@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from threading import RLock
+from threading import RLock, local
 from typing import Callable, Iterator
 
 from apscheduler.events import EVENT_JOB_MAX_INSTANCES
@@ -29,11 +29,33 @@ NOTIFICATION_RETRY_SECONDS = 60
 class _DispatchSafeScheduler(BackgroundScheduler):
     def __init__(self) -> None:
         self._dispatch_lock = RLock()
+        self._dispatch_state = local()
         super().__init__()
 
     def _process_jobs(self):
         with self._dispatch_lock:
-            return super()._process_jobs()
+            self._dispatch_state.removed = {}
+            try:
+                return super()._process_jobs()
+            finally:
+                del self._dispatch_state.removed
+
+    def remove_job(self, job_id, jobstore=None):
+        removed = getattr(self._dispatch_state, "removed", None)
+        if removed is None:
+            return super().remove_job(job_id, jobstore)
+        with self._jobstores_lock:
+            job = self.get_job(job_id, jobstore)
+            super().remove_job(job_id, jobstore)
+            if job is not None:
+                removed[(job._jobstore_alias, job_id)] = job
+
+    def _dispatch_event(self, event):
+        if event.code == EVENT_JOB_MAX_INSTANCES:
+            # 跳过事件在 job 已被移除后发布，携带本轮原 job，不能按 ID 猜当前任务身份。
+            removed = getattr(self._dispatch_state, "removed", {})
+            event.skipped_job = removed.get((event.jobstore, event.job_id))
+        super()._dispatch_event(event)
 
     def shutdown(self, wait=True):
         # APScheduler 在停止时先切换存储模式；必须等当前派发结束，避免移除单次 job 报错。
@@ -222,35 +244,33 @@ class TaskScheduler:
         task.next_run = self.task_next_run(task.id)
 
     def _on_job_skipped(self, event) -> None:
-        """执行槽被上一次还没跑完的调用占满时，把已到点的提醒重新排上。
-
-        APScheduler 跳过这次触发后，会按「这次触发之后没有下一次触发时间」把 job 从存储里删掉：
-        单次提醒会就此永久消失，按周的最后工作日则是整周不再提醒。这里统一补一次延迟重试——
-        单次提醒走既有的 retry_at 语义重新排一次，重启后仍能从 retry_at 恢复；
-        按周的最后工作日补发一次，跑完由 _run_task 排回下一周。
-        interval / weekly 这类自带下一次触发时间的 job 不受影响，不在这里补。
-        """
-        with self._lock:
-            task = self._tasks.get(event.job_id)
-            # 已被删除、停用或再次编辑过（调度器里已有新 job）时不复活旧提醒、不覆盖新配置。
-            if (task is None or not task.enabled or self._stopping
-                    or task.trigger_type not in {"once", "weekly_last_workday"}
-                    or self._scheduler.get_job(task.id) is not None):
+        """被占槽丢弃的单次 job 延后重试，保持原任务或补发请求身份与执行限制。"""
+        job = getattr(event, "skipped_job", None)
+        if job is None or not isinstance(job.trigger, DateTrigger) or len(job.args) != 2:
+            return
+        task_id, identity = job.args
+        snooze = job.id == self._snooze_job_id(task_id)
+        with self._lock, self._scheduler._jobstores_lock:
+            task = self._tasks.get(task_id)
+            if task is None or self._stopping or self._scheduler.get_job(job.id) is not None:
                 return
-            if task.trigger_type == "once":
-                task.retry_at = (datetime.now().astimezone()
-                                 + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)).isoformat()
-                self._schedule_task(task)
-            else:
-                # retry_at 只允许单次提醒持有（validate 会把其它类型判成坏记录），周期提醒
-                # 不占用它：重启时按配置重算即可，不需要额外的持久化字段。
-                self._scheduler.add_job(
-                    self._run_task,
-                    DateTrigger(run_date=datetime.now().astimezone() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)),
-                    id=task.id, args=[task.id, task], replace_existing=True, misfire_grace_time=None,
-                )
+            if snooze:
+                if self._snooze_requests.get(task_id) is not identity:
+                    return
+            elif not task.enabled or task is not identity:
+                return
+            retry_time = datetime.now().astimezone() + timedelta(seconds=NOTIFICATION_RETRY_SECONDS)
+            self._scheduler.add_job(
+                job.func, DateTrigger(run_date=retry_time), id=job.id, args=job.args, kwargs=job.kwargs,
+                executor=job.executor, name=job.name, coalesce=job.coalesce, max_instances=job.max_instances,
+                replace_existing=True, misfire_grace_time=None,
+            )
+            if not snooze:
+                if task.trigger_type == "once":
+                    task.retry_at = retry_time.isoformat()
                 task.next_run = self.task_next_run(task.id)
-        self._notify_changed()
+        if not snooze:
+            self._notify_changed()
 
     def _notify(self, task_id: str, *, expected: Task | None = None) -> Task | None:
         """定时触发路径：停用中的提醒不发通知，返回实际通知的任务。

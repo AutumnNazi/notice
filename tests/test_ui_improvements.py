@@ -894,6 +894,97 @@ class SnoozeSchedulerTests(unittest.TestCase):
         finally:
             scheduler._scheduler.shutdown(wait=True)
 
+    def test_new_snooze_waits_for_busy_previous_request_instead_of_being_lost(self):
+        from apscheduler.events import EVENT_JOB_MAX_INSTANCES
+
+        entered, release, skipped, completed = Event(), Event(), Event(), Event()
+        scheduler = TaskScheduler(MagicMock())
+        calls = []
+
+        def send(task):
+            calls.append(task.id)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+            else:
+                completed.set()
+
+        scheduler.notifier.send.side_effect = send
+        scheduler._scheduler.add_listener(lambda _event: skipped.set(), EVENT_JOB_MAX_INSTANCES)
+        scheduler.start()
+        try:
+            task = self._future_once_task("busy-snooze-recovery")
+            scheduler.upsert_task(task)
+            original = scheduler._scheduler.get_job(task.id)
+            scheduler.snooze_task(task.id, minutes=0)
+            self.assertTrue(entered.wait(3))
+            scheduler.snooze_task(task.id, minutes=0)
+            request = scheduler._snooze_requests[task.id]
+            self.assertTrue(skipped.wait(3))
+            retry = scheduler._scheduler.get_job(scheduler._snooze_job_id(task.id))
+            self.assertIsNotNone(retry, "补发执行槽被旧请求占用时也必须保留新请求")
+            self.assertIs(retry.args[1], request)
+            self.assertEqual(retry.max_instances, 1)
+            self.assertIs(scheduler._scheduler.get_job(task.id), original)
+            release.set()
+            executor = scheduler._scheduler._lookup_executor("default")
+            deadline = time.monotonic() + 3
+            while executor._instances.get(retry.id, 0) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(executor._instances.get(retry.id, 0))
+            scheduler._scheduler.modify_job(retry.id, next_run_time=datetime.now(retry.next_run_time.tzinfo))
+            self.assertTrue(completed.wait(3))
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(task.enabled)
+            self.assertIs(scheduler._scheduler.get_job(task.id), original)
+        finally:
+            release.set()
+            scheduler.shutdown()
+
+    def test_delayed_busy_event_does_not_revive_canceled_or_completed_snooze_request(self):
+        from apscheduler.events import EVENT_JOB_MAX_INSTANCES
+
+        for operation in ("delete", "shutdown", "new-completed"):
+            with self.subTest(operation=operation):
+                entered, release, skipped = Event(), Event(), Event()
+                scheduler = TaskScheduler(MagicMock())
+                events = []
+
+                def capture(event):
+                    events.append(event)
+                    skipped.set()
+
+                scheduler._scheduler.remove_listener(scheduler._on_job_skipped)
+                scheduler._scheduler.add_listener(capture, EVENT_JOB_MAX_INSTANCES)
+                scheduler.notifier.send.side_effect = lambda _task: (entered.set(), release.wait(5))
+                scheduler.start()
+                try:
+                    task = self._future_once_task("stale-busy-event")
+                    scheduler.upsert_task(task)
+                    scheduler.snooze_task(task.id, minutes=0)
+                    self.assertTrue(entered.wait(3))
+                    scheduler.snooze_task(task.id, minutes=0)
+                    request = scheduler._snooze_requests[task.id]
+                    self.assertTrue(skipped.wait(3))
+                    event = events[0]
+                    self.assertIs(event.skipped_job.args[1], request)
+                    if operation == "delete":
+                        scheduler.remove_task(task.id)
+                    elif operation == "shutdown":
+                        scheduler.shutdown()
+                    else:
+                        scheduler.snooze_task(task.id, minutes=5)
+                        new_job = scheduler._scheduler.get_job(event.job_id)
+                        scheduler._remove_job(new_job.id)
+                        with patch.object(scheduler.notifier, "send"):
+                            new_job.func(*new_job.args)
+                    scheduler._on_job_skipped(event)
+                    self.assertIsNone(scheduler._scheduler.get_job(event.job_id))
+                    self.assertNotIn(task.id, scheduler._snooze_requests)
+                finally:
+                    release.set()
+                    scheduler.shutdown()
+
     def test_failed_snooze_retries_without_changing_original_schedule(self):
         notifier = MagicMock()
         notifier.send.side_effect = OSError("补发失败")
@@ -1238,6 +1329,41 @@ class CoreRegressionTests(unittest.TestCase):
         # 这里同样会启动真实调度器线程，和 SnoozeSchedulerTests 一样先收干净 Tk 解释器。
         _reclaim_idle_tk_interpreters()
 
+    def test_busy_interval_keeps_its_periodic_job_without_one_off_retry(self):
+        from apscheduler.events import EVENT_JOB_MAX_INSTANCES
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        entered, release, skipped = Event(), Event(), Event()
+        scheduler = TaskScheduler(MagicMock())
+        scheduler.notifier.send.side_effect = lambda _task: (entered.set(), release.wait(5))
+        events = []
+
+        def capture(event):
+            events.append(event)
+            skipped.set()
+
+        scheduler._scheduler.add_listener(capture, EVENT_JOB_MAX_INSTANCES)
+        scheduler.start()
+        try:
+            task = Task(id="busy-interval", title="定期提醒", trigger_type="interval",
+                        trigger_config={"minutes": 10})
+            scheduler.upsert_task(task)
+            original = scheduler._scheduler.get_job(task.id)
+            scheduler._scheduler.modify_job(task.id, next_run_time=datetime.now(original.next_run_time.tzinfo))
+            self.assertTrue(entered.wait(3))
+            scheduler._scheduler.modify_job(task.id, next_run_time=datetime.now(original.next_run_time.tzinfo))
+            self.assertTrue(skipped.wait(3))
+            self.assertIs(scheduler._scheduler.get_job(task.id), original)
+            self.assertIsInstance(original.trigger, IntervalTrigger)
+            self.assertIsNone(events[0].skipped_job)
+            self.assertIsNone(task.retry_at)
+            self.assertTrue(task.enabled)
+            self.assertGreater(original.next_run_time, datetime.now(original.next_run_time.tzinfo))
+            self.assertEqual(scheduler.notifier.send.call_count, 1)
+        finally:
+            release.set()
+            scheduler.shutdown()
+
     def test_edited_once_waits_for_busy_executor_slot_instead_of_being_lost(self):
         from apscheduler.events import EVENT_JOB_MAX_INSTANCES
 
@@ -1334,6 +1460,54 @@ class CoreRegressionTests(unittest.TestCase):
         finally:
             release.set()
             scheduler.shutdown()
+
+    def test_delayed_busy_event_does_not_revive_deleted_disabled_or_replaced_task(self):
+        from apscheduler.events import EVENT_JOB_MAX_INSTANCES
+
+        for operation in ("delete", "disable", "replace", "sync", "shutdown"):
+            with self.subTest(operation=operation):
+                entered, release, skipped = Event(), Event(), Event()
+                scheduler = TaskScheduler(MagicMock())
+                events = []
+
+                def capture(event):
+                    events.append(event)
+                    skipped.set()
+
+                scheduler._scheduler.remove_listener(scheduler._on_job_skipped)
+                scheduler._scheduler.add_listener(capture, EVENT_JOB_MAX_INSTANCES)
+                scheduler.notifier.send.side_effect = lambda _task: (entered.set(), release.wait(5))
+                scheduler.start()
+                try:
+                    task = SnoozeSchedulerTests._future_once_task("stale-task-event")
+                    scheduler.upsert_task(task)
+                    job = scheduler._scheduler.get_job(task.id)
+                    scheduler._scheduler.modify_job(task.id, next_run_time=datetime.now(job.next_run_time.tzinfo))
+                    self.assertTrue(entered.wait(3))
+                    scheduler._schedule_task(task)
+                    scheduler._scheduler.modify_job(task.id, next_run_time=datetime.now(job.next_run_time.tzinfo))
+                    self.assertTrue(skipped.wait(3))
+                    self.assertIs(events[0].skipped_job.args[1], task)
+                    if operation == "delete":
+                        scheduler.remove_task(task.id)
+                    elif operation == "disable":
+                        task.enabled = False
+                    elif operation == "shutdown":
+                        scheduler.shutdown()
+                    else:
+                        replacement = SnoozeSchedulerTests._future_once_task(task.id)
+                        if operation == "sync":
+                            scheduler.sync_tasks([replacement])
+                        else:
+                            scheduler.upsert_task(replacement)
+                        # 新单次已被取走但尚未发送，job 不存在也不能据此复活旧任务。
+                        scheduler._remove_job(replacement.id)
+                    scheduler._on_job_skipped(events[0])
+                    self.assertIsNone(scheduler._scheduler.get_job(task.id))
+                    self.assertIsNone(task.retry_at)
+                finally:
+                    release.set()
+                    scheduler.shutdown()
 
     def test_failed_once_retry_survives_save_reload_and_then_succeeds(self):
         with TemporaryDirectory() as directory:
