@@ -76,6 +76,71 @@ class TaskFileCorruptionTests(unittest.TestCase):
         self.assertEqual(tasks, [])
         self.assert_quarantined(path, raw, stderr, "JSON")
 
+    def test_excessive_json_nesting_is_archived_before_task_or_settings_fallback(self):
+        depth = sys.getrecursionlimit() * 4
+        raw = b'{"tasks":[],"extra":' + b'[' * depth + b'0' + b']' * depth + b'}'
+        for kind in ("tasks", "settings"):
+            with self.subTest(kind=kind), TemporaryDirectory() as directory:
+                path = Path(directory) / f"{kind}.json"
+                path.write_bytes(raw)
+                store = TaskStore(path)
+                errors = []
+                with self.assertLogs("store", level="WARNING") as diagnostics:
+                    try:
+                        fallback = store.load_tasks() if kind == "tasks" else store.load_settings(path)
+                    except Exception as exc:
+                        errors.append(exc)
+                    self.assertEqual(errors, [], "嵌套过深不能让数据加载直接崩溃")
+                self.assertEqual(fallback, [] if kind == "tasks" else SETTINGS_DEFAULTS)
+                self.assert_quarantined(path, raw, "\n".join(diagnostics.output), "嵌套")
+                if kind == "tasks":
+                    store.save_tasks(fallback)
+                    self.assertEqual(store.load_tasks(), [])
+                else:
+                    store.save_settings(fallback, path)
+                    self.assertEqual(store.load_settings(path), SETTINGS_DEFAULTS)
+                self.assertEqual([p.read_bytes() for p in path.parent.glob("*.corrupt-*")], [raw])
+
+    def test_deep_json_backup_failure_blocks_fallback_save_until_archived(self):
+        depth = sys.getrecursionlimit() * 4
+        raw = b'{"tasks":[],"extra":' + b'[' * depth + b'0' + b']' * depth + b'}'
+        for kind in ("tasks", "settings"):
+            with self.subTest(kind=kind), TemporaryDirectory() as directory:
+                path = Path(directory) / f"{kind}.json"
+                path.write_bytes(raw)
+                store = TaskStore(path)
+                with patch("store.os.fsync", side_effect=OSError("磁盘已满")), \
+                        self.assertLogs("store", level="WARNING"):
+                    fallback = store.load_tasks() if kind == "tasks" else store.load_settings(path)
+                    with self.assertRaises(OSError):
+                        if kind == "tasks":
+                            store.save_tasks(fallback)
+                        else:
+                            store.save_settings(fallback, path)
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+                with self.assertLogs("store", level="WARNING"):
+                    if kind == "tasks":
+                        store.save_tasks(fallback)
+                    else:
+                        store.save_settings(fallback, path)
+                self.assertEqual([p.read_bytes() for p in path.parent.glob("*.corrupt-*")], [raw])
+
+    def test_supported_nested_settings_roundtrip_without_corruption_backup(self):
+        nested = "中文值"
+        for _ in range(20):
+            nested = {"items": [nested]}
+        settings = SETTINGS_DEFAULTS | {"extra": nested}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = TaskStore(path)
+            store.save_settings(settings, path)
+            loaded = store.load_settings(path)
+            self.assertEqual(loaded, settings)
+            store.save_settings(loaded, path)
+            self.assertEqual(store.load_settings(path), settings)
+            self.assertEqual(list(path.parent.glob("*.corrupt-*")), [])
+
     def test_temporary_read_failure_cannot_overwrite_valid_reminders_with_fallback(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.json"

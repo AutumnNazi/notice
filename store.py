@@ -134,6 +134,10 @@ class TaskStore:
             self._unread_paths.discard(path)
             self._quarantine(path, label, f"UTF-8 解码失败：{error}")
             return None
+        except RecursionError as error:
+            self._unread_paths.discard(path)
+            self._quarantine(path, label, f"JSON 嵌套过深，无法安全读取：{error}")
+            return None
         except ValueError as error:
             self._unread_paths.discard(path)
             self._quarantine(path, label, f"JSON 解析失败：{error}")
