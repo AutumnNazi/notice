@@ -41,6 +41,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SEARCH_PLACEHOLDER = "搜索标题、内容或周期..."
 # 搜索每敲一个键就整批重建列表会让输入卡住：输入停顿这么久才真正筛一次。
 SEARCH_DEBOUNCE_MS = 150
+UI_REQUEST_POLL_MS = 100
 # 首页插画只保留最近用过的几种尺寸：拖动窗口会连续产生新尺寸，缓存与保活列表都得有上限，
 # 否则每跨过一次尺寸边界就多留一张整幅 PhotoImage（实测 4 态 50 轮多留 26.6 MiB）。
 BOAT_ART_CACHE_LIMIT = 4
@@ -54,6 +55,9 @@ class NoticeApp:
 
         self.root = tk.Tk()
         self.root.report_callback_exception = self._report_callback_exception
+        self._ui_requests: queue.Queue = queue.Queue()
+        self._closing = threading.Event()
+        self._ui_request_after_id: str | None = None
         self.ui_scale = 1.0
         self._configure_display_metrics()
         self.root.ui_scale = self.ui_scale
@@ -169,6 +173,7 @@ class NoticeApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_requested)
         # 桌面提醒里最常用的动作是新建，给一个不依赖鼠标位置的入口。
         self.root.bind("<Control-n>", self._on_new_task_shortcut)
+        self._drain_ui_requests()
         self.tray.start()
 
     def run(self) -> None:
@@ -1895,7 +1900,7 @@ class NoticeApp:
         self._refresh_ui()
 
     def toggle_pause_all_from_tray(self) -> None:
-        self.root.after(0, self.toggle_pause_all)
+        self._post_ui_request(self.toggle_pause_all)
 
     def toggle_autostart(self) -> None:
         try:
@@ -1936,7 +1941,7 @@ class NoticeApp:
         self.tray.refresh()
 
     def request_hide_window(self) -> None:
-        self.root.after(0, self.hide_window)
+        self._post_ui_request(self.hide_window)
 
     def on_close_requested(self) -> None:
         action = str(self.settings.get("close_action", "")).strip()
@@ -1965,7 +1970,34 @@ class NoticeApp:
             self.exit_app()
 
     def show_window(self) -> None:
-        self.root.after(0, self._show_window_sync)
+        self._post_ui_request(self._show_window_sync)
+
+    def _post_ui_request(self, callback, delay: int = 0) -> None:
+        if self._closing.is_set():
+            return
+        if threading.current_thread() is not threading.main_thread():
+            # 托盘与唤醒管道可能早于 mainloop 启动，后台连 after() 也不能调用。
+            self._ui_requests.put((callback, delay))
+            return
+
+        def run() -> None:
+            if not self._closing.is_set():
+                callback()
+
+        self.root.after(delay, run)
+
+    def _drain_ui_requests(self) -> None:
+        self._ui_request_after_id = None
+        try:
+            while not self._closing.is_set():
+                try:
+                    callback, delay = self._ui_requests.get_nowait()
+                except queue.Empty:
+                    break
+                self._post_ui_request(callback, delay)
+        finally:
+            if not self._closing.is_set():
+                self._ui_request_after_id = self.root.after(UI_REQUEST_POLL_MS, self._drain_ui_requests)
 
     def _show_window_sync(self) -> None:
         self.root.deiconify()
@@ -1993,13 +2025,15 @@ class NoticeApp:
 
     def add_task_from_tray(self) -> None:
         self.show_window()
-        self.root.after(120, self.add_task)
+        self._post_ui_request(self.add_task, 120)
 
     def open_settings_from_tray(self) -> None:
         self.show_window()
-        self.root.after(120, self.open_settings)
+        self._post_ui_request(self.open_settings, 120)
 
     def exit_app(self) -> None:
+        if getattr(self, "_closing", None) is not None and self._closing.is_set():
+            return
         # 保存失败时保留时钟、托盘和调度，用户可释放磁盘空间后重新退出。
         try:
             self._persist_tasks()
@@ -2007,6 +2041,10 @@ class NoticeApp:
             logging.getLogger(__name__).error("退出前保存提醒失败：%s", exc, exc_info=True)
             show_error(self.root, "退出失败", f"提醒保存失败，程序仍继续运行。请处理后重试：{exc}")
             return
+        self._closing.set()
+        if self._ui_request_after_id is not None:
+            self.root.after_cancel(self._ui_request_after_id)
+            self._ui_request_after_id = None
         if self._clock_after_id is not None:
             self.root.after_cancel(self._clock_after_id)
             self._clock_after_id = None
@@ -2019,7 +2057,7 @@ class NoticeApp:
         self.root.after(0, self.root.destroy)
 
     def request_exit_app(self) -> None:
-        self.root.after(0, self.exit_app)
+        self._post_ui_request(self.exit_app)
 
     def _selected_task(self) -> Task | None:
         if not self.selected_task_id:

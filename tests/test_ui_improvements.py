@@ -104,6 +104,9 @@ class ThreadSafeRefreshTests(unittest.TestCase):
         self.app = app_module.NoticeApp.__new__(app_module.NoticeApp)
         self.app.root = MagicMock()
         self.app._refresh_queue = queue.Queue()
+        self.app._ui_requests = queue.Queue()
+        self.app._closing = Event()
+        self.app._ui_request_after_id = None
         self.calls: list[str] = []
         self.app._persist_tasks = lambda: self.calls.append("persist")
         self.app._refresh_ui = lambda: self.calls.append("refresh")
@@ -124,6 +127,112 @@ class ThreadSafeRefreshTests(unittest.TestCase):
         self.app.root.after.assert_not_called()
         self.assertEqual(self.calls, ["persist", "refresh"])
         self.assertTrue(self.app._refresh_queue.empty(), "主线程不需要绕一圈队列")
+
+    def test_tray_and_wake_worker_requests_never_call_tk_directly(self):
+        actions = ("show_window", "request_hide_window", "toggle_pause_all_from_tray",
+                   "add_task_from_tray", "open_settings_from_tray", "request_exit_app")
+        for name in actions:
+            with self.subTest(action=name):
+                self.app.root.reset_mock()
+                self.app._ui_requests = queue.Queue()
+                self.app._closing = Event()
+                errors = []
+
+                def worker():
+                    try:
+                        getattr(self.app, name)()
+                    except Exception as exc:
+                        errors.append(exc)
+
+                thread = threading.Thread(target=worker)
+                thread.start()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.app.root.after.assert_not_called()
+                self.assertFalse(self.app._ui_requests.empty(), "后台 UI 操作必须保留到主线程消费")
+
+    def test_startup_wake_is_delivered_on_main_thread_with_real_tk(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.app.root = root
+        calls, errors = [], []
+        self.app._show_window_sync = lambda: calls.append(threading.current_thread())
+
+        def worker():
+            try:
+                self.app.show_window()
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        try:
+            thread.start()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(calls, [])
+            self.app._drain_ui_requests()
+            root.update()
+            self.assertEqual(calls, [threading.main_thread()])
+            self.assertTrue(self.app._ui_requests.empty())
+        finally:
+            for timer in root.tk.call("after", "info"):
+                root.after_cancel(timer)
+            root.destroy()
+
+    def test_ui_requests_preserve_order_and_delay_and_skip_after_close(self):
+        self.app._ui_requests.put((lambda: self.calls.append("show"), 0))
+        self.app._ui_requests.put((lambda: self.calls.append("add"), 120))
+        self.app._drain_ui_requests()
+        scheduled = self.app.root.after.call_args_list
+        self.assertEqual([call.args[0] for call in scheduled], [0, 120, 100])
+        scheduled[0].args[1]()
+        self.assertEqual(self.calls, ["show"])
+        self.app._closing.set()
+        scheduled[1].args[1]()
+        self.app.show_window()
+        self.assertEqual(self.calls, ["show"])
+        self.assertEqual(self.app.root.after.call_count, 3)
+        self.assertTrue(self.app._ui_requests.empty())
+
+    def test_ui_request_poll_rearms_when_scheduling_a_request_fails(self):
+        self.app._ui_requests.put((lambda: None, 0))
+        self.app.root.after.side_effect = [tk.TclError("调度失败"), "poll"]
+        with self.assertRaises(tk.TclError):
+            self.app._drain_ui_requests()
+        self.assertEqual(self.app.root.after.call_args.args[0], 100)
+        self.assertEqual(self.app._ui_request_after_id, "poll")
+
+    def test_successful_exit_stops_ui_request_poll_and_is_idempotent(self):
+        self.app._clock_after_id = None
+        self.app._weather_after_id = None
+        self.app._ui_request_after_id = "ui-poll"
+        self.app.tray = MagicMock()
+        self.app.scheduler = MagicMock()
+        with patch.object(app_module, "stop_helper") as stop:
+            self.app.exit_app()
+            self.app.exit_app()
+        self.assertTrue(self.app._closing.is_set())
+        self.assertIsNone(self.app._ui_request_after_id)
+        self.app.root.after_cancel.assert_called_once_with("ui-poll")
+        self.app.tray.stop.assert_called_once()
+        self.app.scheduler.shutdown.assert_called_once()
+        stop.assert_called_once()
+        self.assertEqual(self.calls, ["persist"])
+
+    def test_failed_exit_keeps_ui_request_poll_and_accepts_new_wake(self):
+        self.app._ui_request_after_id = "ui-poll"
+        self.app._persist_tasks = MagicMock(side_effect=OSError("磁盘已满"))
+        self.app._show_window_sync = lambda: self.calls.append("show")
+        with patch.object(app_module, "show_error"), self.assertLogs("gui.app", level="ERROR"):
+            self.app.exit_app()
+        self.assertFalse(self.app._closing.is_set())
+        self.assertEqual(self.app._ui_request_after_id, "ui-poll")
+        self.app.root.after_cancel.assert_not_called()
+        self.app.show_window()
+        self.app.root.after.call_args.args[1]()
+        self.assertEqual(self.calls, ["show"])
 
     def test_drain_applies_pending_worker_refresh_exactly_once(self):
         for _ in range(3):
