@@ -28,6 +28,19 @@ class UiPalette:
 PALETTE = UiPalette()
 
 
+def _bind_variable_redraw(widget: tk.Canvas, variable: tk.Variable) -> None:
+    trace = variable.trace_add("write", lambda *_args: widget._draw())
+
+    def remove_trace(event: tk.Event) -> None:
+        nonlocal trace
+        # 变量可能比控件活得更久，只解除本控件持有的监听。
+        if event.widget is widget and trace is not None:
+            variable.trace_remove("write", trace)
+            trace = None
+
+    widget.bind("<Destroy>", remove_trace)
+
+
 def draw_round_rect(
     canvas: tk.Canvas,
     x1: int,
@@ -515,8 +528,7 @@ class RoundedSelect(tk.Canvas):
         self.ui_scale = ui_scale
         self._hover = False
         self._menu: tk.Menu | None = None
-        self._variable_trace = self.variable.trace_add("write", lambda *_args: self._draw())
-        self.bind("<Destroy>", self._remove_variable_trace)
+        _bind_variable_redraw(self, self.variable)
         self.bind("<Configure>", lambda _event: self._draw())
         self.bind("<Button-1>", self._open_menu)
         self.bind("<Enter>", self._enter)
@@ -576,11 +588,6 @@ class RoundedSelect(tk.Canvas):
         finally:
             menu.grab_release()
 
-    def _remove_variable_trace(self, event: tk.Event) -> None:
-        if event.widget is self and self._variable_trace is not None:
-            self.variable.trace_remove("write", self._variable_trace)
-            self._variable_trace = None
-
     def _choose(self, value: str) -> None:
         self.variable.set(value)
         if self.command is not None:
@@ -614,7 +621,7 @@ class ToggleSwitch(tk.Canvas):
         self.variable = variable
         self.ui_scale = ui_scale
         self.command = command
-        self.variable.trace_add("write", lambda *_args: self._draw())
+        _bind_variable_redraw(self, self.variable)
         self.bind("<Configure>", lambda _event: self._draw())
         self.bind("<Button-1>", self._toggle)
         self._draw()

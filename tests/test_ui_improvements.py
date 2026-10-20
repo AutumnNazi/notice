@@ -25,7 +25,7 @@ from core.scheduler import DEFAULT_SNOOZE_MINUTES, SNOOZE_JOB_PREFIX, TaskSchedu
 import core.notifier as notifier_module
 from store import TaskStore
 import gui.app as app_module
-from gui.theme import PALETTE, PillButton, RoundedSelect, SlimScrollbar, elide_text, scale
+from gui.theme import PALETTE, PillButton, RoundedSelect, SlimScrollbar, ToggleSwitch, elide_text, scale
 from gui.task_dialog import TRIGGER_KEY_TO_LABEL, TaskDialog
 from types import SimpleNamespace
 
@@ -948,6 +948,65 @@ class RoundedSelectLifecycleTests(unittest.TestCase):
         menu.invoke(1)
         self.assertEqual(self.variable.get(), "第二项")
         callback.assert_called_once_with("第二项")
+
+
+class ToggleSwitchLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+
+    def test_switch_destroy_removes_only_its_own_variable_listener(self):
+        variable = tk.BooleanVar(self.root, value=False)
+        calls, errors = [], []
+        variable.trace_add("write", lambda *_args: calls.append(variable.get()))
+        control = ToggleSwitch(self.root, variable=variable, width=44, height=24, ui_scale=1)
+        self.root.report_callback_exception = lambda _type, value, _tb: errors.append(value)
+        control.destroy()
+        variable.set(True)
+        self.assertEqual(errors, [], "已销毁的开关不能继续访问 Tcl 控件")
+        self.assertEqual(calls, [True])
+        self.assertEqual(len(variable.trace_info()), 1)
+
+    def test_switch_parent_destroy_does_not_accumulate_variable_listeners(self):
+        variable = tk.BooleanVar(self.root, value=False)
+        for _ in range(12):
+            parent = tk.Frame(self.root)
+            ToggleSwitch(parent, variable=variable, width=44, height=24, ui_scale=1)
+            self.assertEqual(len(variable.trace_info()), 1)
+            parent.destroy()
+            self.assertEqual(variable.trace_info(), [], "父窗口销毁时也必须移除开关监听")
+        variable.set(True)
+
+    def test_switch_toggle_and_external_updates_still_redraw_once(self):
+        variable = tk.BooleanVar(self.root, value=False)
+        callback = MagicMock()
+        control = ToggleSwitch(self.root, variable=variable, width=44, height=24,
+                               ui_scale=1, command=callback)
+        with patch.object(control, "_draw", wraps=control._draw) as redraw:
+            control._toggle(None)
+            self.assertTrue(variable.get())
+            callback.assert_called_once_with(True)
+            redraw.assert_called_once()
+            redraw.reset_mock()
+            variable.set(False)
+            redraw.assert_called_once()
+            callback.assert_called_once_with(True)
+
+    def test_destroying_one_switch_keeps_other_switch_on_shared_variable(self):
+        variable = tk.BooleanVar(self.root, value=False)
+        first = ToggleSwitch(self.root, variable=variable, width=44, height=24, ui_scale=1)
+        second = ToggleSwitch(self.root, variable=variable, width=44, height=24, ui_scale=1)
+        errors = []
+        self.root.report_callback_exception = lambda _type, value, _tb: errors.append(value)
+        first.destroy()
+        with patch.object(second, "_draw", wraps=second._draw) as redraw:
+            variable.set(True)
+            redraw.assert_called_once()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(variable.trace_info()), 1)
+        second.destroy()
+        self.assertEqual(variable.trace_info(), [])
 
 
 class SnoozeSchedulerTests(unittest.TestCase):
