@@ -119,6 +119,8 @@ class SettingsDialog(tk.Toplevel):
         self.configure(bg=PALETTE.card_bg)
 
         self.result: dict[str, object] | None = None
+        self._topmost_after_id: str | None = None
+        self.bind("<Destroy>", self._cancel_topmost_reset, add="+")
         self.ui_family = getattr(master, "font_family_var", None).get() if hasattr(master, "font_family_var") else "Microsoft YaHei UI"
         self.ui_scale = float(getattr(master, "ui_scale", 1.0))
         apply_ttk_theme(ttk.Style(self), self.ui_family, self.ui_scale)
@@ -328,9 +330,20 @@ class SettingsDialog(tk.Toplevel):
         try:
             self.lift(self.master)
             self.attributes("-topmost", True)
-            self.after(120, lambda: self.attributes("-topmost", False))
+            if self._topmost_after_id is not None:
+                self.after_cancel(self._topmost_after_id)
+            self._topmost_after_id = self.after(120, self._reset_topmost)
         except tk.TclError:
             pass
+
+    def _reset_topmost(self) -> None:
+        self._topmost_after_id = None
+        self.attributes("-topmost", False)
+
+    def _cancel_topmost_reset(self, event: tk.Event) -> None:
+        if event.widget is self and self._topmost_after_id is not None:
+            self.after_cancel(self._topmost_after_id)
+            self._topmost_after_id = None
 
     def _release_modal_for_native_dialog(self) -> None:
         try:
@@ -345,12 +358,7 @@ class SettingsDialog(tk.Toplevel):
         self.update_idletasks()
 
     def _restore_modal_after_native_dialog(self) -> None:
-        try:
-            self.lift(self.master)
-            self.attributes("-topmost", True)
-            self.after(120, lambda: self.attributes("-topmost", False))
-        except tk.TclError:
-            pass
+        self._raise_dialog()
         try:
             self.grab_set()
             self.focus_force()

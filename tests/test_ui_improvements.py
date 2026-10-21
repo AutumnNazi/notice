@@ -803,6 +803,9 @@ class NewTaskShortcutTests(_RealAppTests):
         self.assertTrue(self.app.root.bind("<Control-n>"), "Ctrl+N 没有绑定到主窗口")
 
     def test_pressing_control_n_opens_the_new_task_flow(self):
+        # Windows 只向焦点窗口派发按键；映射窗口不保证前一测试已交回焦点。
+        self.app.root.focus_force()
+        self.app.root.update()
         with patch.object(self.app, "add_task") as add_task:
             self.app.root.event_generate("<Control-n>")
             self.app.root.update()

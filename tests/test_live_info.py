@@ -256,6 +256,77 @@ class LunarResultStateTests(unittest.TestCase):
         self.app._refresh_lunar_async.assert_not_called()
 
 
+class SettingsTimerLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.root = app_module.tk.Tk()
+        self.root.withdraw()
+        self.root.font_family_var = app_module.tk.StringVar(self.root, value="Microsoft YaHei UI")
+        self.addCleanup(self.root.destroy)
+
+    def dialog(self):
+        return SettingsDialog(self.root, font_choices=["Microsoft YaHei UI"],
+                              selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                              custom_font_dir="", close_action="ask")
+
+    def test_destroy_cancels_topmost_reset_but_preserves_unrelated_timer(self):
+        unrelated = self.root.after(5000, lambda: None)
+        dialog = self.dialog()
+        self.assertEqual(len(self.root.tk.call("after", "info")), 2)
+        dialog.destroy()
+        self.assertEqual(self.root.tk.call("after", "info"), (unrelated,),
+                         "关闭设置时必须撤销访问旧窗口的定时回调")
+
+    def test_repeated_raise_and_native_dialog_restore_share_one_reset_timer(self):
+        dialog = self.dialog()
+        for _ in range(12):
+            dialog._raise_dialog()
+            with patch("gui.settings_dialog.filedialog.askdirectory", return_value=""):
+                dialog._pick_font_dir()
+            self.assertEqual(len(self.root.tk.call("after", "info")), 1,
+                             "重复置顶不能堆积恢复定时器")
+        self.assertIs(dialog.grab_current(), dialog)
+        dialog.destroy()
+        self.assertEqual(tuple(self.root.tk.call("after", "info")), ())
+
+    def test_save_closes_settings_and_cancels_pending_timer(self):
+        dialog = self.dialog()
+        dialog._save()
+        self.assertEqual(dialog.result, {
+            "font_family": "Microsoft YaHei UI",
+            "autostart_enabled": False,
+            "custom_font_dir": "",
+            "close_action": "ask",
+        })
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(tuple(self.root.tk.call("after", "info")), ())
+
+    def test_topmost_reset_finishes_and_can_be_scheduled_again(self):
+        dialog = self.dialog()
+        deadline = time.monotonic() + 2
+        while dialog._topmost_after_id is not None and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.01)
+        self.assertIsNone(dialog._topmost_after_id)
+        self.assertFalse(dialog.attributes("-topmost"))
+        dialog._raise_dialog()
+        self.assertIsNotNone(dialog._topmost_after_id)
+        dialog.font_box.destroy()
+        self.assertIsNotNone(dialog._topmost_after_id, "子控件销毁不能撤销窗口的定时器")
+        dialog.destroy()
+        self.assertEqual(tuple(self.root.tk.call("after", "info")), ())
+
+    def test_parent_window_destroy_also_cancels_settings_timer(self):
+        parent = app_module.tk.Toplevel(self.root)
+        parent.font_family_var = self.root.font_family_var
+        dialog = SettingsDialog(parent, font_choices=["Microsoft YaHei UI"],
+                                selected_font="Microsoft YaHei UI", autostart_enabled=False,
+                                custom_font_dir="", close_action="ask")
+        self.assertIsNotNone(dialog._topmost_after_id)
+        parent.destroy()
+        self.assertIsNone(dialog._topmost_after_id)
+        self.assertEqual(tuple(self.root.tk.call("after", "info")), ())
+
+
 class LiveInfoUITests(unittest.TestCase):
     """主界面实时信息（天气、农历、时钟）的回归测试。"""
 
