@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import io
 import json
 import subprocess
@@ -8,6 +9,7 @@ import threading
 import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -173,6 +175,125 @@ class WeatherServiceTests(unittest.TestCase):
                 self.assertEqual(live_info.lunar_date(day), expected)
 
 
+class HTTPResponseBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        # 启动 HTTP 工作线程前在主线程回收旧 Tk 解释器，避免跨线程析构。
+        gc.collect()
+
+    def serve(self, pieces, *, delay=0.0, chunked=False, header_delay=0.0):
+        finished = threading.Event()
+        disconnected = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                try:
+                    time.sleep(header_delay)
+                    self.send_response(200)
+                    if chunked:
+                        self.send_header("Transfer-Encoding", "chunked")
+                    else:
+                        self.send_header("Content-Length", str(sum(map(len, pieces))))
+                    self.end_headers()
+                    for piece in pieces:
+                        data = (f"{len(piece):x}\r\n".encode() + piece + b"\r\n"
+                                if chunked else piece)
+                        self.wfile.write(data)
+                        self.wfile.flush()
+                        time.sleep(delay)
+                    if chunked:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                except OSError:
+                    disconnected.set()
+                finally:
+                    finished.set()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def cleanup():
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+        self.addCleanup(cleanup)
+        return f"http://127.0.0.1:{server.server_port}/", finished, disconnected
+
+    def test_slow_body_exceeds_deadline_and_releases_response(self):
+        pieces = [b"{"] + [b" "] * 30 + [b"}"]
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                url, finished, disconnected = self.serve(pieces, delay=0.04, chunked=chunked)
+                started = time.monotonic()
+                with patch.object(live_info, "NETWORK_TIMEOUT_SECONDS", 0.12), \
+                     self.assertLogs("core.live_info", level="WARNING"):
+                    with self.assertRaises(TimeoutError):
+                        live_info._read_json(url)
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertTrue(finished.wait(2))
+                self.assertTrue(disconnected.is_set(), "超时后应关闭响应连接")
+
+    def test_normal_split_and_chunked_json_remain_readable(self):
+        payload = json.dumps({"city": "郑州", "temperature": 0}, ensure_ascii=False).encode("utf-8")
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                url, finished, _ = self.serve([payload[:10], payload[10:11], payload[11:]],
+                                              delay=0.01, chunked=chunked)
+                with patch.object(live_info, "NETWORK_TIMEOUT_SECONDS", 0.5):
+                    self.assertEqual(live_info._read_json(url), {"city": "郑州", "temperature": 0})
+                self.assertTrue(finished.wait(2))
+
+    def test_oversized_valid_json_is_rejected(self):
+        payload = b"{}" + b" " * 1_000_000
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                url, finished, _ = self.serve([payload], chunked=chunked)
+                with self.assertLogs("core.live_info", level="WARNING"):
+                    with self.assertRaisesRegex(ValueError, "过大"):
+                        live_info._read_json(url)
+                self.assertTrue(finished.wait(2))
+
+    def test_empty_response_is_rejected_and_closed(self):
+        response = io.BytesIO()
+        with patch.object(live_info, "urlopen", return_value=response), \
+             self.assertLogs("core.live_info", level="WARNING"):
+            with self.assertRaises(ValueError):
+                live_info._read_json("https://example.invalid/")
+        self.assertTrue(response.closed)
+
+    def test_exact_size_limit_remains_readable(self):
+        url, finished, _ = self.serve([b"{}" + b" " * 999_998], chunked=True)
+        self.assertEqual(live_info._read_json(url), {})
+        self.assertTrue(finished.wait(2))
+
+    def test_header_elapsed_time_consumes_body_budget(self):
+        url, finished, disconnected = self.serve([b"{"] + [b" "] * 30 + [b"}"],
+                                                  delay=0.02, header_delay=0.12)
+        started = time.monotonic()
+        with patch.object(live_info, "NETWORK_TIMEOUT_SECONDS", 0.2), \
+             self.assertLogs("core.live_info", level="WARNING"):
+            with self.assertRaises(TimeoutError):
+                live_info._read_json(url)
+        self.assertLess(time.monotonic() - started, 0.28)
+        self.assertTrue(finished.wait(2))
+        self.assertTrue(disconnected.is_set())
+
+    def test_header_wait_retains_socket_timeout(self):
+        url, finished, disconnected = self.serve([b"{}"], header_delay=0.3)
+        started = time.monotonic()
+        with patch.object(live_info, "NETWORK_TIMEOUT_SECONDS", 0.05), \
+             self.assertLogs("core.live_info", level="WARNING"):
+            with self.assertRaises(TimeoutError):
+                live_info._read_json(url)
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertTrue(finished.wait(2))
+        self.assertTrue(disconnected.is_set())
+
+
 class LunarResultStateTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 10, 18, 10)
@@ -331,6 +452,8 @@ class LiveInfoUITests(unittest.TestCase):
     """主界面实时信息（天气、农历、时钟）的回归测试。"""
 
     def setUp(self):
+        # 前一个用例的 Tk 变量与解释器循环引用须在新后台取数线程启动前回收。
+        gc.collect()
         for name in ("Notifier", "TaskScheduler", "TrayController", "register_font_directories",
                      "ensure_icon_assets", "stop_helper"):
             patcher = patch.object(app_module, name)

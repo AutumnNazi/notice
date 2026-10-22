@@ -359,7 +359,12 @@ class TaskScheduler:
                     task.retry_at = retry_time.isoformat()
                     task.next_run = self.task_next_run(task.id)
             elif task.trigger_type == "weekly_last_workday" and task.enabled:
-                self._schedule_task(task)
+                try:
+                    self._schedule_task(task)
+                except (ValueError, TypeError, KeyError) as exc:
+                    task.enabled = False
+                    task.next_run = None
+                    _LOGGER.warning("[提醒调度] 提醒“%s”的触发配置无法续排，已停用：%s", task.title, exc)
             else:
                 task.next_run = None if self._paused else self.task_next_run(task_id)
         self._notify_changed()

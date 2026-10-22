@@ -3022,6 +3022,84 @@ class CoreRegressionTests(unittest.TestCase):
         finally:
             scheduler._scheduler.shutdown(wait=True)
 
+    def test_weekly_workday_calendar_boundary_disables_task_and_preserves_send_failure(self):
+        def supported_workday(day):
+            if day.year > 2040:
+                raise NotImplementedError("test calendar ends in 2040")
+            return day.weekday() < 5
+
+        for send_failure in (None, OSError("notification unavailable")):
+            with self.subTest(send_failure=send_failure):
+                notifier, on_change = MagicMock(), MagicMock()
+                notifier.send.side_effect = send_failure
+                scheduler = TaskScheduler(notifier, on_change)
+                scheduler.start()
+                try:
+                    task = Task(id="calendar-boundary", trigger_type="weekly_last_workday",
+                                trigger_config={"hour": 18}, next_run="2040-12-31 18:00:00")
+                    scheduler._tasks[task.id] = task
+                    raised = None
+                    with patch("core.scheduler.datetime", wraps=datetime) as clock, \
+                            patch("core.scheduler.is_workday", side_effect=supported_workday), \
+                            self.assertLogs("core.scheduler", level="WARNING") as logs:
+                        clock.now.return_value = datetime(2040, 12, 31, 18, 0, 1)
+                        try:
+                            scheduler._run_task(task.id, task)
+                        except Exception as exc:
+                            raised = exc
+                        self.assertFalse(task.enabled)
+                        self.assertIsNone(task.next_run)
+                        self.assertIsNone(scheduler._scheduler.get_job(task.id))
+                        self.assertIs(raised, send_failure)
+                        notifier.send.assert_called_once_with(task)
+                        on_change.assert_called_once_with()
+                    self.assertTrue(any("2041" in message for message in logs.output))
+                finally:
+                    scheduler.shutdown()
+
+    def test_weekly_workday_supported_calendar_rearms_after_send(self):
+        notifier, on_change = MagicMock(), MagicMock()
+        scheduler = TaskScheduler(notifier, on_change)
+        scheduler.start()
+        try:
+            task = Task(id="supported-workday", trigger_type="weekly_last_workday",
+                        trigger_config={"hour": 18})
+            scheduler._tasks[task.id] = task
+            with patch("core.scheduler.datetime", wraps=datetime) as clock, \
+                    patch("core.scheduler.is_workday", side_effect=lambda day: day.weekday() < 5):
+                clock.now.return_value = datetime(2040, 12, 20, 18, 0, 1)
+                scheduler._run_task(task.id, task)
+            self.assertTrue(task.enabled)
+            self.assertIsNotNone(task.next_run)
+            self.assertIsNotNone(scheduler._scheduler.get_job(task.id))
+            notifier.send.assert_called_once_with(task)
+            on_change.assert_called_once_with()
+        finally:
+            scheduler.shutdown()
+
+    def test_weekly_workday_rearm_only_degrades_known_configuration_errors(self):
+        for error in (ValueError("invalid calendar"), TypeError("invalid time"),
+                      KeyError("hour"), RuntimeError("unexpected scheduler failure")):
+            with self.subTest(error=error):
+                scheduler = TaskScheduler(MagicMock(), MagicMock())
+                task = Task(id="rearm-error", trigger_type="weekly_last_workday",
+                            trigger_config={"hour": 18})
+                scheduler._tasks[task.id] = task
+                with patch.object(scheduler, "_schedule_task", side_effect=error):
+                    if isinstance(error, RuntimeError):
+                        with self.assertRaises(RuntimeError) as raised:
+                            scheduler._run_task(task.id, task)
+                        self.assertIs(raised.exception, error)
+                        self.assertTrue(task.enabled)
+                        scheduler.on_change.assert_not_called()
+                    else:
+                        with self.assertLogs("core.scheduler", level="WARNING"):
+                            scheduler._run_task(task.id, task)
+                        self.assertFalse(task.enabled)
+                        self.assertIsNone(task.next_run)
+                        scheduler.on_change.assert_called_once_with()
+                scheduler.notifier.send.assert_called_once_with(task)
+
     def test_weekly_workday_skips_a_full_holiday_week(self):
         scheduler = TaskScheduler(MagicMock())
         with patch("core.scheduler.datetime", wraps=datetime) as clock:

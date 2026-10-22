@@ -10,6 +10,7 @@ import json
 import math
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -34,6 +35,7 @@ WEATHER_RETRY_SECONDS = 60
 LUNAR_RETRY_SECONDS = 60
 WEATHER_MAX_AGE_SECONDS = 3600
 NETWORK_TIMEOUT_SECONDS = 10
+MAX_RESPONSE_BYTES = 1_000_000
 POWERSHELL = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
 WEATHER_CODES = {
     0: "晴", 1: "晴间多云", 2: "多云", 3: "阴", 45: "雾", 48: "雾凇",
@@ -88,13 +90,30 @@ def _powershell_json(script: str, timeout: int = 12) -> dict:
 
 def _read_json(url: str) -> dict:
     request = Request(url, headers={"User-Agent": "ShiChenFa/1.0", "Accept": "application/json"})
+    deadline = time.monotonic() + NETWORK_TIMEOUT_SECONDS
     try:
         with urlopen(request, timeout=NETWORK_TIMEOUT_SECONDS) as response:
-            body = response.read(1_000_001)
+            body = bytearray()
+            # read1 不等整段正文填满；持续有数据时也检查截止点，避免慢滴响应占住天气线程。
+            # 连接、响应头及分块协议的内部读取仍受 socket 空闲超时约束，不是硬总时限。
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("服务响应读取超时")
+                piece = response.read1(min(64 * 1024, MAX_RESPONSE_BYTES + 1 - len(body)))
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("服务响应读取超时")
+                body.extend(piece)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise ValueError("服务返回内容过大")
+                if not piece:
+                    break
     except OSError as exc:
         # HTTPError 是 URLError 子类，状态码在 code 上；带上 URL 才能区分是定位还是天气失败
         _LOGGER.warning("网络请求失败：url=%s 状态码=%s %s: %s",
                         url, getattr(exc, "code", "-"), type(exc).__name__, exc, exc_info=True)
+        raise
+    except ValueError as exc:
+        _LOGGER.warning("服务响应读取失败：url=%s %s: %s", url, type(exc).__name__, exc)
         raise
     try:
         data = json.loads(body.decode("utf-8-sig"))
