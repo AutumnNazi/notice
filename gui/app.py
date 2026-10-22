@@ -31,7 +31,7 @@ from gui.close_dialog import CloseChoiceDialog
 from gui.message_dialog import ask_yes_no, show_error, show_info
 from gui.settings_dialog import SettingsDialog
 from gui.task_dialog import TaskDialog
-from gui.theme import PALETTE, PillButton, RoundedFrame, SlimScrollbar, apply_ttk_theme, elide_text, font, scale
+from gui.theme import CanvasMenu, PALETTE, PillButton, RoundedFrame, SlimScrollbar, apply_ttk_theme, elide_text, font, scale
 from gui.tray import TrayController
 from single_instance import stop_helper
 from store import TaskStore
@@ -117,7 +117,7 @@ class NoticeApp:
         self._search_placeholder: tk.Label | None = None
         self.filter_btn: tk.Label | None = None
         # 两类菜单都只建一次、反复复用：每次弹出都新建会让 Tcl widget 随点击次数线性增长。
-        self._task_menu: tk.Menu | None = None
+        self._task_menu: CanvasMenu | None = None
         self._filter_menu: tk.Menu | None = None
         self.filter_type: str = "all"
         self.task_canvas: tk.Canvas | None = None
@@ -1447,7 +1447,7 @@ class NoticeApp:
     def _open_task_menu(self, task_id: str) -> None:
         self.selected_task_id = task_id
         task = self._selected_task()
-        menu = self._reusable_menu("_task_menu")
+        menu = self._reusable_task_menu()
         menu.delete(0, "end")
         menu.add_command(label="编辑", command=self.edit_selected_task)
         menu.add_command(label=f"{DEFAULT_SNOOZE_MINUTES} 分钟后再说", command=self.snooze_selected_task)
@@ -1457,8 +1457,19 @@ class NoticeApp:
             x = self.root.winfo_pointerx()
             y = self.root.winfo_pointery()
             menu.tk_popup(x, y)
-        finally:
+        except Exception:
+            # 弹出中途失败时弹层可能已经抓住输入，先还回去再让异常继续往上冒。
             menu.grab_release()
+            raise
+
+    def _reusable_task_menu(self) -> CanvasMenu:
+        # 卡片菜单复用同一个弹层：条目每次重填，窗口本身不重建，点多少次都不累积。
+        # 与 _reusable_menu 一样按属性取：测试里的最小替身不会走完整初始化。
+        menu = getattr(self, "_task_menu", None)
+        if menu is None or not menu.winfo_exists():
+            menu = CanvasMenu(self.root, family=self.font_family_var.get(), ui_scale=self.ui_scale)
+            self._task_menu = menu
+        return menu
 
     def _reusable_menu(self, attribute: str) -> tk.Menu:
         # 菜单复用同一个 Tcl widget：菜单项每次重填，窗口本身不重建，点多少次都不累积。

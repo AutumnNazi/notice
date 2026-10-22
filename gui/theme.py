@@ -597,6 +597,222 @@ class RoundedSelect(tk.Canvas):
         self.values = list(values)
 
 
+def _fit_inside_screen(position: int, size: int, screen: int) -> int:
+    """把弹出位置收进屏幕，贴边弹出时整块菜单都要能看见。
+
+    指针已经在主屏之外（多显示器副屏）时原样返回：那里按主屏宽度硬拉回来，
+    菜单反而会跳到另一块屏幕上。
+    """
+    if position + size <= screen or position > screen:
+        return position
+    return max(0, screen - size)
+
+
+class CanvasMenu(tk.Toplevel):
+    """自绘弹出菜单，替代原生 tk.Menu。
+
+    原生菜单由系统绘制，字体、配色、圆角都跟界面其余控件对不上。这里在 Canvas 上
+    自己画面板与条目，并保留 gui/app.py 用到的 tk.Menu 子集
+    （delete / add_command / index / entrycget / invoke / tk_popup / grab_release），
+    调用方的弹出流程不必跟着改。
+
+    与 tk.Menu 唯一的差别：tk_popup 不再阻塞到用户点选为止，弹出后立即返回，
+    关闭交给自己的绑定（点菜单外、Esc、点条目），因此不会卡住任何调用方。
+    """
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        family: str,
+        ui_scale: float,
+        radius: int | None = None,
+        item_height: int | None = None,
+        min_width: int | None = None,
+    ) -> None:
+        super().__init__(master)
+        self.overrideredirect(True)
+        self.withdraw()
+        self.configure(bg=PALETTE.card_bg)
+        self.ui_scale = ui_scale
+        self.radius = radius if radius is not None else scale(10, ui_scale)
+        self.item_height = item_height if item_height is not None else scale(28, ui_scale)
+        self.padding_x = scale(12, ui_scale)
+        self.padding_y = scale(6, ui_scale)
+        self._hover_inset = scale(4, ui_scale)
+        self._min_width = min_width if min_width is not None else scale(132, ui_scale)
+        self._items: list[tuple[str, Callable[[], None] | None]] = []
+        self._font = font(family, 10, ui_scale)
+        self._metrics = tkfont.Font(root=self, font=self._font)
+        self._hover_index: int | None = None
+        self._width = self._min_width
+        self._height = self.item_height + self.padding_y * 2
+        self._shown = False
+        self._previous_focus: tk.Misc | None = None
+        # 面板与条目都画在同一张画布上：反复弹出只改图元，不新建子控件。
+        self.canvas = tk.Canvas(self, bg=PALETTE.card_bg, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        # 绑定挂在弹层自己身上：抓住输入后落在别处的点击也会派发到这里，
+        # 「点菜单外面」与「点菜单项」因此共用同一套命中判断。
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Escape>", self._on_escape)
+
+    @property
+    def is_open(self) -> bool:
+        return self._shown
+
+    # ── tk.Menu 兼容接口 ────────────────────────────────────────────
+    def delete(self, first: int | str, last: int | str | None = None) -> None:
+        """只支持整份清空：调用方每次弹出前都重填全部条目。"""
+        if first not in (0, "0") or last not in ("end", tk.END):
+            raise ValueError(f"CanvasMenu 只支持 delete(0, \"end\")，收到 {first!r} 与 {last!r}")
+        self._items.clear()
+        self._hover_index = None
+
+    def add_command(self, *, label: str, command: Callable[[], None] | None = None) -> None:
+        self._items.append((label, command))
+
+    def index(self, index: int | str) -> int:
+        """tk.Menu.index 的等价物：只支持 "end" 与整数下标。"""
+        if index == "end" or index == tk.END:
+            return len(self._items) - 1
+        return int(index)
+
+    def entrycget(self, index: int, option: str) -> str:
+        if option != "label":
+            raise ValueError(f"CanvasMenu 只记录 label，收到 {option!r}")
+        return self._items[index][0]
+
+    def invoke(self, index: int) -> None:
+        command = self._items[index][1]
+        if command is not None:
+            command()
+
+    def tk_popup(self, x: int, y: int) -> None:
+        """在 (x, y) 处弹出并立刻返回，不像原生菜单那样阻塞到点选为止。"""
+        self._measure()
+        self._draw()
+        pos_x = _fit_inside_screen(x, self._width, self.winfo_screenwidth())
+        pos_y = _fit_inside_screen(y, self._height, self.winfo_screenheight())
+        self._previous_focus = self._focused_widget()
+        self.geometry(f"{self._width}x{self._height}+{pos_x}+{pos_y}")
+        self.deiconify()
+        self.lift()
+        self.update_idletasks()
+        try:
+            self.grab_set()
+        except Exception:
+            # 抢不到输入抓取就别把窗口留在屏幕上：那样会变成一个点不动的浮层。
+            self.close()
+            raise
+        self._shown = True
+        try:
+            self.focus_force()
+        except tk.TclError:
+            # 拿不到焦点时 Esc 不生效，鼠标路径照常可用，不值得为它中断弹出。
+            pass
+
+    def grab_release(self) -> None:
+        # 没有抓住输入时也允许调用：调用方在 finally 里释放，不该为状态判断出错。
+        try:
+            super().grab_release()
+        except tk.TclError:
+            pass
+
+    def close(self) -> None:
+        """收起弹层：先还输入抓取，再藏窗口，最后把焦点交回原处。"""
+        self._shown = False
+        self._hover_index = None
+        self.grab_release()
+        try:
+            self.withdraw()
+        except tk.TclError:
+            pass
+        previous = self._previous_focus
+        self._previous_focus = None
+        if previous is not None:
+            try:
+                if previous.winfo_exists():
+                    previous.focus_set()
+            except tk.TclError:
+                pass
+
+    # ── 内部实现 ────────────────────────────────────────────────────
+    def _focused_widget(self) -> tk.Misc | None:
+        try:
+            widget = self.focus_get()
+        except (tk.TclError, KeyError):
+            return None
+        # 复用弹层时焦点可能还停在它自己身上，那不算「弹出前的焦点」。
+        return None if widget is None or widget is self else widget
+
+    def _measure(self) -> None:
+        text_width = max(
+            (self._metrics.measure(label) for label, _command in self._items),
+            default=0,
+        )
+        self._width = max(self._min_width, text_width + self.padding_x * 2)
+        self._height = len(self._items) * self.item_height + self.padding_y * 2
+
+    def _index_at(self, y: int) -> int | None:
+        local = y - self.padding_y
+        if local < 0 or not self._items:
+            return None
+        index = local // self.item_height
+        return int(index) if index < len(self._items) else None
+
+    def _draw(self) -> None:
+        canvas = self.canvas
+        canvas.delete("all")
+        width = max(1, self._width)
+        height = max(1, self._height)
+        draw_round_rect(
+            canvas, 0, 0, width, height, self.radius,
+            fill=PALETTE.card_bg, outline=PALETTE.border, tag="panel",
+        )
+        for index, (label, _command) in enumerate(self._items):
+            top = self.padding_y + index * self.item_height
+            if index == self._hover_index:
+                draw_round_rect(
+                    canvas,
+                    self._hover_inset,
+                    top,
+                    width - self._hover_inset,
+                    top + self.item_height,
+                    max(1, self.radius - self._hover_inset),
+                    fill=PALETTE.accent_soft,
+                    outline="",
+                    tag="hover",
+                )
+            canvas.create_text(
+                self.padding_x,
+                top + self.item_height // 2,
+                text=label,
+                anchor="w",
+                fill=PALETTE.text_primary,
+                font=self._font,
+                tags="label",
+            )
+
+    def _on_press(self, event: tk.Event) -> None:
+        index = self._index_at(event.y)
+        # 先关再执行：菜单项可能弹出对话框，浮层不该盖在上面，也不该握着输入抓取。
+        self.close()
+        if index is not None:
+            self.invoke(index)
+
+    def _on_motion(self, event: tk.Event) -> None:
+        index = self._index_at(event.y)
+        if index != self._hover_index:
+            self._hover_index = index
+            self._draw()
+
+    def _on_escape(self, _event: tk.Event) -> str:
+        self.close()
+        return "break"
+
+
 class ToggleSwitch(tk.Canvas):
     def __init__(
         self,

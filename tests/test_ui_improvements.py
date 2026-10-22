@@ -26,7 +26,7 @@ from core.scheduler import DEFAULT_SNOOZE_MINUTES, SNOOZE_JOB_PREFIX, TaskSchedu
 import core.notifier as notifier_module
 from store import TaskStore
 import gui.app as app_module
-from gui.theme import PALETTE, PillButton, RoundedSelect, SlimScrollbar, ToggleSwitch, elide_text, scale
+from gui.theme import CanvasMenu, PALETTE, PillButton, RoundedSelect, SlimScrollbar, ToggleSwitch, elide_text, scale
 from gui.task_dialog import TRIGGER_KEY_TO_LABEL, TaskDialog
 from types import SimpleNamespace
 
@@ -1041,8 +1041,10 @@ class _MenuOpeningTests(unittest.TestCase):
     tk_popup 是模态调用：它会抢走输入抓取，然后一直等一次真实点击才返回；
     实测 Escape、unpost、合成 Button 事件都无法让它返回，同步调用会永久卡住，
     而且同进程里存在过别的 Tk 解释器时会更容易卡死。这里把 tk_popup 换成只做记录
-    的替身：菜单是否泄漏由「root.children 里的 Menu 数量」量测，这与菜单真的弹出
-    与否无关；替身同时记下调用次数，用来证明被测代码确实走到了 tk_popup。
+    的替身：菜单是否泄漏由「root 下的弹层数量」量测，这与菜单真的弹出与否无关；
+    替身同时记下调用次数，用来证明被测代码确实走到了 tk_popup。
+
+    筛选菜单仍是原生 tk.Menu，卡片菜单已换成自绘的 CanvasMenu，两者都要打桩。
     """
 
     def setUp(self):
@@ -1051,14 +1053,17 @@ class _MenuOpeningTests(unittest.TestCase):
         self.app.root.withdraw()
         self.addCleanup(self.app.root.destroy)
         self.popup_calls: list[tuple[int, int]] = []
-        patcher = patch.object(tk.Menu, "tk_popup", self._recording_popup)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for target in (tk.Menu, CanvasMenu):
+            patcher = patch.object(target, "tk_popup", self._recording_popup)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.app.root.winfo_pointerx = lambda: 12
         self.app.root.winfo_pointery = lambda: 34
         self.app.selected_task_id = None
         self.app.task_cards = {}
         self.app.filter_type = "all"
+        self.app.ui_scale = 1.0
+        self.app.font_family_var = tk.StringVar(self.app.root, value="Microsoft YaHei UI")
         self.app._selected_task = lambda: None
         self.app._set_filter_type = lambda _key: None
         # 卡片菜单分支要读触发描述与下次运行时间，替身省掉真实任务对象。
@@ -1068,16 +1073,25 @@ class _MenuOpeningTests(unittest.TestCase):
         self.widget.pack()
         self.addCleanup(self.widget.destroy)
 
-    def _recording_popup(self, x=0, y=0, entry=""):
+    def _recording_popup(self, x=0, y=0):
         # 挂在类上的是绑定方法，调用形式是 menu.tk_popup(x, y)，所以这里拿不到 menu 本身。
         self.popup_calls.append((x, y))
         return "break"
 
     def _menu_children(self) -> int:
+        """原生菜单（筛选菜单）数量。"""
         return sum(
             1
             for child in self.app.root.winfo_children()
             if child.winfo_class() == "Menu"
+        )
+
+    def _popup_children(self) -> int:
+        """自绘弹层（卡片菜单）数量。"""
+        return sum(
+            1
+            for child in self.app.root.winfo_children()
+            if child.winfo_class() == "Toplevel"
         )
 
 
@@ -1088,30 +1102,208 @@ class MenuLifetimeTests(_MenuOpeningTests):
     # 20 次会把 root.children 里的 Menu 从 1 个涨到 21 个，泄漏一眼可见。
     OPEN_TIMES = 20
 
-    def _measure_repeated_opens(self, opener) -> tuple[int, int]:
+    def _measure_repeated_opens(self, opener, counter) -> tuple[int, int]:
         opener()
-        baseline = self._menu_children()
+        baseline = counter()
         for _ in range(self.OPEN_TIMES):
             opener()
             self.app.root.update_idletasks()
         # 确认被测代码每次都真的走到了弹出菜单这一步，而不只是没建菜单。
         self.assertEqual(len(self.popup_calls), self.OPEN_TIMES + 1,
                          "菜单没有走到 tk_popup，泄漏断言就失去意义")
-        return baseline, self._menu_children()
+        return baseline, counter()
 
     def test_task_menu_does_not_accumulate_children(self):
         baseline, after = self._measure_repeated_opens(
-            lambda: self.app._open_task_menu("task-1"))
+            lambda: self.app._open_task_menu("task-1"), self._popup_children)
 
-        self.assertGreaterEqual(baseline, 1, "菜单没弹出来，说明测试没走到 tk_popup")
-        self.assertEqual(after, baseline, "反复打开任务菜单后 Tcl widget 数量增长")
+        self.assertGreaterEqual(baseline, 1, "弹层没建出来，说明测试没走到 tk_popup")
+        self.assertEqual(after, baseline, "反复打开卡片菜单后弹层数量增长")
 
     def test_filter_menu_does_not_accumulate_children(self):
         baseline, after = self._measure_repeated_opens(
-            lambda: self.app._open_filter_menu(self.widget))
+            lambda: self.app._open_filter_menu(self.widget), self._menu_children)
 
         self.assertGreaterEqual(baseline, 1, "菜单没弹出来，说明测试没走到 tk_popup")
         self.assertEqual(after, baseline, "反复打开筛选菜单后 Tcl widget 数量增长")
+
+
+class CanvasTaskMenuTests(unittest.TestCase):
+    """卡片菜单换成自绘弹层后，除了外观，交互必须和原生菜单等价。
+
+    这里不打桩 tk_popup：自绘弹层弹出后立刻返回，不像原生菜单那样阻塞等待点击，
+    所以可以真的把窗口弹出来，再合成事件驱动关闭路径。
+    """
+
+    ACTION_NAMES = ("edit_selected_task", "snooze_selected_task",
+                    "toggle_selected_task", "delete_selected_task")
+
+    def setUp(self):
+        self.app = app_module.NoticeApp.__new__(app_module.NoticeApp)
+        self.app.root = tk.Tk()
+        self.app.root.geometry("420x320+60+60")
+        self.app.root.withdraw()
+        self.addCleanup(self._cleanup)
+        self.app.root.winfo_pointerx = lambda: 120
+        self.app.root.winfo_pointery = lambda: 90
+        self.app.selected_task_id = None
+        self.app.task_cards = {}
+        self.app.filter_type = "all"
+        self.app.ui_scale = 1.0
+        self.app.font_family_var = tk.StringVar(self.app.root, value="Microsoft YaHei UI")
+        self.app._selected_task = lambda: Task(
+            id="task-1", title="周报", trigger_type="interval", enabled=True)
+        self.app._describe_trigger = lambda _task: ""
+        self.app._describe_next_run = lambda _task: ""
+        self.actions: list[str] = []
+        for name in self.ACTION_NAMES:
+            setattr(self.app, name, lambda action=name: self.actions.append(action))
+
+    def _cleanup(self):
+        menu = getattr(self.app, "_task_menu", None)
+        if menu is not None:
+            try:
+                menu.close()
+            except tk.TclError:
+                pass
+        self.app.root.destroy()
+
+    def _open(self):
+        self.app._open_task_menu("task-1")
+        self.app.root.update()
+        return self.app._task_menu
+
+    def _labels(self, menu) -> list[str]:
+        return [menu.entrycget(index, "label") for index in range(menu.index("end") + 1)]
+
+    def _item_center(self, menu, index: int) -> int:
+        return menu.padding_y + index * menu.item_height + menu.item_height // 2
+
+    def _click_item(self, menu, index: int) -> None:
+        menu.event_generate("<Button-1>", x=menu.padding_x + 4, y=self._item_center(menu, index))
+        self.app.root.update()
+
+    def test_menu_lists_the_four_actions_in_order(self):
+        menu = self._open()
+
+        self.assertEqual(self._labels(menu), [
+            "编辑",
+            f"{DEFAULT_SNOOZE_MINUTES} 分钟后再说",
+            "停用提醒",
+            "删除",
+        ])
+
+    def test_menu_opens_at_the_pointer(self):
+        menu = self._open()
+
+        self.assertTrue(menu.is_open, "菜单没有弹出来")
+        self.assertEqual((menu.winfo_rootx(), menu.winfo_rooty()), (120, 90),
+                         "菜单没有落在指针位置")
+
+    def test_menu_stays_inside_the_screen_near_the_bottom_right_corner(self):
+        screen_width = self.app.root.winfo_screenwidth()
+        screen_height = self.app.root.winfo_screenheight()
+        self.app.root.winfo_pointerx = lambda: screen_width - 4
+        self.app.root.winfo_pointery = lambda: screen_height - 4
+
+        menu = self._open()
+
+        self.assertLessEqual(menu.winfo_rootx() + menu.winfo_width(), screen_width,
+                             "菜单右侧被屏幕裁掉")
+        self.assertLessEqual(menu.winfo_rooty() + menu.winfo_height(), screen_height,
+                             "菜单底部被屏幕裁掉")
+
+    def test_each_item_runs_its_own_action_and_closes_the_menu(self):
+        for index, name in enumerate(self.ACTION_NAMES):
+            with self.subTest(action=name):
+                menu = self._open()
+                self._click_item(menu, index)
+
+                self.assertEqual(self.actions, [name])
+                self.assertFalse(menu.is_open, "点了菜单项之后菜单还开着")
+                self.assertIsNone(self.app.root.grab_current(), "菜单关闭后没有释放 grab")
+                self.actions.clear()
+
+    def test_clicking_outside_the_menu_closes_it_without_running_an_action(self):
+        menu = self._open()
+        self.assertIsNotNone(self.app.root.grab_current(),
+                             "菜单没有抓住输入，外部点击会漏到下层窗口")
+
+        menu.event_generate("<Button-1>", x=menu.padding_x, y=menu.winfo_height() + 40)
+        self.app.root.update()
+
+        self.assertFalse(menu.is_open, "点菜单外面没有关闭菜单")
+        self.assertEqual(self.actions, [], "点菜单外面误触发了菜单项")
+        self.assertIsNone(self.app.root.grab_current(), "菜单关闭后没有释放 grab")
+
+    def test_escape_closes_the_menu_without_running_an_action(self):
+        menu = self._open()
+
+        menu.event_generate("<Escape>")
+        self.app.root.update()
+
+        self.assertFalse(menu.is_open, "按 Esc 没有关闭菜单")
+        self.assertEqual(self.actions, [], "按 Esc 误触发了菜单项")
+        self.assertIsNone(self.app.root.grab_current(), "菜单关闭后没有释放 grab")
+
+    def test_repeated_opens_reuse_one_popup_and_one_set_of_canvas_items(self):
+        menu = self._open()
+        children = len(self.app.root.winfo_children())
+        canvas_items = len(menu.canvas.find_all())
+        self.assertGreater(canvas_items, 0, "弹层里什么都没画")
+
+        for _ in range(12):
+            self.assertIs(self._open(), menu, "每次弹出都新建了弹层")
+            menu.close()
+            self.assertIsNone(self.app.root.grab_current(), "关闭弹层后没有释放 grab")
+
+        self.assertEqual(len(self.app.root.winfo_children()), children, "反复弹出累积了子控件")
+        self.assertEqual(len(menu.canvas.find_all()), canvas_items, "反复弹出累积了画布图元")
+
+    def test_popup_failure_releases_the_grab_and_does_not_swallow_the_error(self):
+        self._open()
+
+        with patch.object(CanvasMenu, "grab_set", side_effect=tk.TclError("抓取失败")):
+            with self.assertRaises(tk.TclError):
+                self.app._open_task_menu("task-1")
+
+        self.assertIsNone(self.app.root.grab_current(), "弹出失败后留下了残留 grab")
+        self.assertFalse(self.app._task_menu.is_open, "弹出失败后菜单窗口还留在屏幕上")
+
+    def test_popup_failure_with_other_exception_also_cleans_up(self):
+        self._open()
+
+        with patch.object(CanvasMenu, "grab_set", side_effect=RuntimeError("意外错误")):
+            with self.assertRaises(RuntimeError):
+                self.app._open_task_menu("task-1")
+
+        self.assertIsNone(self.app.root.grab_current(), "弹出异常后留下了残留 grab")
+
+    def test_panel_uses_project_palette(self):
+        menu = self._open()
+        canvas = menu.canvas
+
+        panel = canvas.find_withtag("panel")
+        self.assertEqual(len(panel), 1, "弹层面板没画出来")
+        self.assertEqual(canvas.itemcget(panel[0], "fill"), PALETTE.card_bg)
+        self.assertEqual(canvas.itemcget(panel[0], "outline"), PALETTE.border)
+
+        labels = canvas.find_withtag("label")
+        self.assertEqual(len(labels), 4, "菜单项没有画全")
+        self.assertEqual(canvas.itemcget(labels[0], "fill"), PALETTE.text_primary)
+
+    def test_hovering_an_item_highlights_only_that_item(self):
+        menu = self._open()
+
+        menu.event_generate("<Motion>", x=menu.padding_x + 4, y=self._item_center(menu, 1))
+        self.app.root.update()
+        hover = menu.canvas.find_withtag("hover")
+        self.assertEqual(len(hover), 1, "悬停没有高亮菜单项")
+        self.assertEqual(menu.canvas.itemcget(hover[0], "fill"), PALETTE.accent_soft)
+
+        menu.event_generate("<Motion>", x=menu.padding_x + 4, y=menu.winfo_height() + 40)
+        self.app.root.update()
+        self.assertEqual(menu.canvas.find_withtag("hover"), (), "指针移开后高亮还留着")
 
 
 class RoundedSelectLifecycleTests(unittest.TestCase):
