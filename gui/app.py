@@ -105,6 +105,7 @@ class NoticeApp:
         self.style = ttk.Style()
         self.task_cards: dict[str, tk.Widget] = {}
         self.task_dots: dict[str, tk.Label] = {}
+        self._card_render_states: dict[str, tuple] = {}
         self.tk_images: list[tk.PhotoImage] = []
         # 插画与图标按尺寸复用解码结果：同一尺寸反复重绘既不该重复解码，也不该反复占内存。
         self._boat_photo_cache: OrderedDict[tuple[int, int], tk.PhotoImage] = OrderedDict()
@@ -290,6 +291,7 @@ class NoticeApp:
             child.destroy()
         self.task_cards.clear()
         self.task_dots.clear()
+        self._card_render_states.clear()
         self.empty_label = None
         self.pause_button = None
         self.scroll_frame = None
@@ -874,20 +876,7 @@ class NoticeApp:
     def _refresh_ui(self) -> None:
         if not self.scroll_frame:
             return
-        for widget in self.scroll_frame.winfo_children():
-            widget.destroy()
-        self.task_cards.clear()
-        self.task_dots.clear()
-
-        filtered_tasks = self._visible_tasks()
-        self._resolve_selection(filtered_tasks)
-
-        for index, task in enumerate(filtered_tasks):
-            self._render_task_card(task, index)
-        self._rendered_selection = self.selected_task_id
-
-        enabled_count = sum(1 for task in self.tasks if task.enabled)
-        self._sync_list_after_render(filtered_tasks)
+        self._apply_filter()
         self.subtitle_var.set(f"{APP_NAME} · 静水深流，按时而渡")
         if self.pause_button:
             # 按钮写“点下去会发生什么”，与托盘菜单的措辞保持一致；当前是运行还是暂停交给圆点颜色表达，
@@ -957,34 +946,29 @@ class NoticeApp:
         self.tray.refresh()
 
     def _apply_filter(self) -> None:
-        """关键词或筛选变化时只切换既有卡片的显隐，不整批销毁重建。
-
-        卡片内容只跟提醒自身的状态有关，筛选不会改变它；而整批重建 50 条实测要 3 秒左右，
-        搜索每敲一个键都走那条路径会让输入整段卡住。选中项跟着筛选结果变化时，
-        只按同一份渲染代码重建受影响的那两张卡片，高亮不靠就地改色、不会漏掉某一层。
-        """
+        """复用既有卡片，只重建内容或选中状态变化的卡片，并收敛筛选与滚动。"""
         if not self.scroll_frame:
             return
-        previous_selection = self._rendered_selection
         filtered_tasks = self._visible_tasks()
         self._resolve_selection(filtered_tasks)
         visible_ids = [task.id for task in filtered_tasks]
-        if self.selected_task_id != previous_selection:
-            for task_id in (previous_selection, self.selected_task_id):
-                if task_id is None or self.task_cards.get(task_id) is None:
-                    continue
-                task = next((item for item in self.tasks if item.id == task_id), None)
+        tasks_by_id = {task.id: task for task in self.tasks}
+        visible_rows = {task_id: index for index, task_id in enumerate(visible_ids)}
+        for task_id in list(self.task_cards):
+            task = tasks_by_id.get(task_id)
+            if task is None or self._card_render_states.get(task_id) != self._card_render_state(task):
                 self.task_cards.pop(task_id).destroy()
+                self.task_dots.pop(task_id, None)
+                self._card_render_states.pop(task_id, None)
                 if task is not None:
-                    self._render_task_card(task, visible_ids.index(task_id) if task_id in visible_ids else 0)
+                    self._render_task_card(task, visible_rows.get(task_id, 0))
         self._rendered_selection = self.selected_task_id
         visible_set = set(visible_ids)
         for index, task_id in enumerate(visible_ids):
             card = self.task_cards.get(task_id)
             if card is None:
-                # 上次整批重建时这条被筛掉了，卡片根本不存在；这里要补渲染，
-                # 否则搜索期间新建的提醒在清空关键词后不显示，条数却按全集算。
-                task = next((item for item in self.tasks if item.id == task_id), None)
+                # 搜索期间新建但尚未显示过的提醒在这里补卡片。
+                task = tasks_by_id.get(task_id)
                 if task is not None:
                     self._render_task_card(task, index)
                 continue
@@ -1113,12 +1097,20 @@ class NoticeApp:
                 # 不能沿用“不是天气就是农历”的假设去解包，否则会把时间链带崩。
                 logging.getLogger(__name__).warning("忽略未知的实时信息消息：%s", kind)
 
+    def _card_render_state(self, task: Task) -> tuple:
+        # 调度器会就地修改 Task；只保留渲染值，不把可变对象当作旧快照。
+        return (task.title, self._task_time(task), self._task_badge_text(task),
+                self._describe_card_detail(task), self._describe_next_run(task),
+                task.enabled, bool(self.scheduler.paused), task.id == self.selected_task_id,
+                task.priority)
+
     def _render_task_card(self, task: Task, index: int) -> None:
         if not self.scroll_frame:
             return
-        is_selected = task.id == self.selected_task_id
+        state = self._card_render_state(task)
+        title, task_time, badge, detail, next_run, enabled, paused, is_selected, _priority = state
         bg = PALETTE.card_alt_bg if is_selected else PALETTE.card_bg
-        is_effectively_active = task.enabled and not self.scheduler.paused
+        is_effectively_active = enabled and not paused
         title_fg = PALETTE.text_primary if is_effectively_active else PALETTE.text_muted
         desc_fg = PALETTE.text_secondary if is_effectively_active else PALETTE.text_muted
 
@@ -1138,11 +1130,11 @@ class NoticeApp:
             badge_fg = PALETTE.text_muted
             sep_bg = PALETTE.border_soft
 
-        if self.scheduler.paused and task.enabled:
+        if paused and enabled:
             status_text = "暂停"
             status_bg = "#fbf3e6"
             status_fg = "#b58f6d"
-        elif task.enabled:
+        elif enabled:
             status_text = "启用"
             status_bg = "#edf6ee"
             status_fg = "#2e7d32"
@@ -1185,7 +1177,7 @@ class NoticeApp:
 
         time_label = tk.Label(
             time_group,
-            text=self._task_time(task),
+            text=task_time,
             bg=bg,
             fg=time_fg,
             font=font(self.font_family_var.get(), 14, self.ui_scale, "bold"),
@@ -1196,7 +1188,7 @@ class NoticeApp:
 
         badge_label = tk.Label(
             time_group,
-            text=self._task_badge_text(task),
+            text=badge,
             bg=badge_bg,
             fg=badge_fg,
             font=font(self.font_family_var.get(), 8, self.ui_scale),
@@ -1212,7 +1204,7 @@ class NoticeApp:
 
         title_label = tk.Label(
             card,
-            text=task.title,
+            text=title,
             bg=bg,
             fg=title_fg,
             font=font(self.font_family_var.get(), 11, self.ui_scale, "bold"),
@@ -1224,7 +1216,7 @@ class NoticeApp:
         title_font_obj = tkfont.Font(root=title_label, font=font(self.font_family_var.get(), 11, self.ui_scale, "bold"))
         title_label.bind(
             "<Configure>",
-            lambda event, label=title_label, full=task.title, metrics=title_font_obj: self._elide_card_title(
+            lambda event, label=title_label, full=title, metrics=title_font_obj: self._elide_card_title(
                 label, full, metrics, event.width
             ),
             add="+",
@@ -1232,7 +1224,7 @@ class NoticeApp:
 
         desc_label = tk.Label(
             card,
-            text=self._describe_card_detail(task),
+            text=detail,
             bg=bg,
             fg=desc_fg,
             font=font(self.font_family_var.get(), 9, self.ui_scale),
@@ -1249,7 +1241,7 @@ class NoticeApp:
             add="+",
         )
         next_run_label = tk.Label(
-            card, text=self._describe_next_run(task), bg=bg, fg=desc_fg,
+            card, text=next_run, bg=bg, fg=desc_fg,
             font=font(self.font_family_var.get(), 9, self.ui_scale), anchor="w",
         )
         next_run_label.grid(row=2, column=2, columnspan=3, sticky="ew", pady=(0, scale(2, self.ui_scale)))
@@ -1290,6 +1282,7 @@ class NoticeApp:
             widget.bind("<MouseWheel>", self._scroll_task_list)
 
         self.task_cards[task.id] = card_shell
+        self._card_render_states[task.id] = state
 
     def _draw_boat_art(self, canvas: tk.Canvas) -> None:
         canvas.update_idletasks()

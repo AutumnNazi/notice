@@ -11,6 +11,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -441,6 +442,227 @@ class LightweightFilterTests(_RealAppTests):
             self.assertEqual([task.id for task in self.app._visible_tasks()], ["a", "b"],
                              "Esc 之后没有按空关键词重新筛选")
             full.assert_not_called()
+
+
+class IncrementalCardRefreshTests(_RealAppTests):
+    """用户更新提醒时只替换有可见变化的卡片，其他卡片与滚动位置保留。"""
+
+    def setUp(self):
+        _reclaim_idle_tk_interpreters()
+        self.addCleanup(_reclaim_idle_tk_interpreters)
+        super().setUp()
+        self.app.tasks = [
+            Task(id=task_id, title=f"提醒 {task_id}", body="原正文", trigger_type="weekly",
+                 trigger_config={"weekdays": [0], "hour": 9, "minute": 0})
+            for task_id in ("a", "b", "c")
+        ]
+        self.app._refresh_ui()
+        self.app.root.update_idletasks()
+
+    def _card_text(self, task_id: str, row: int) -> str:
+        card = self.app.task_cards[task_id].content
+        return str(card.grid_slaves(row=row, column=2)[0].cget("text"))
+
+    def test_edit_replaces_changed_card_but_preserves_other_cards(self):
+        cards = self.app.task_cards.copy()
+        edited = replace(self.app.tasks[0], title="改后标题", body="改后正文")
+        with patch.object(app_module, "TaskDialog", return_value=SimpleNamespace(result=edited)), \
+             patch.object(self.app.root, "wait_window"):
+            self.app.edit_selected_task()
+        self.app.root.update_idletasks()
+
+        self.assertIs(self.app.task_cards["b"], cards["b"], "编辑一条提醒不应重建其他卡片")
+        self.assertIs(self.app.task_cards["c"], cards["c"])
+        self.assertIsNot(self.app.task_cards["a"], cards["a"])
+        self.assertEqual(self._card_text("a", 0), "改后标题")
+        self.assertEqual(self._card_text("a", 1), "改后正文")
+        self.app.store.save_tasks.assert_called_with(self.app.tasks)
+
+    def test_background_sync_detects_multiple_in_place_changes_and_then_reuses_all_cards(self):
+        cards = self.app.task_cards.copy()
+        task = self.app.tasks[0]
+        task.next_run = (datetime.now() + timedelta(days=1)).replace(hour=10, minute=0).isoformat()
+        self.app.tasks[1].body = "后台改后的正文"
+        self.app._refresh_queue.put(True)
+        with patch.object(self.app, "_render_task_card", wraps=self.app._render_task_card) as render:
+            self.app._drain_refresh_requests()
+            self.app.root.update_idletasks()
+            self.assertEqual(render.call_count, 2)
+            self.assertIsNot(self.app.task_cards["a"], cards["a"])
+            self.assertIsNot(self.app.task_cards["b"], cards["b"])
+            self.assertIs(self.app.task_cards["c"], cards["c"])
+            self.assertIn("明日 10:00", self._card_text("a", 2))
+            self.assertEqual(self._card_text("b", 1), "后台改后的正文")
+            render.reset_mock()
+            self.app._schedule_refresh()
+            self.app.root.update_idletasks()
+            render.assert_not_called()
+
+    def test_toggle_filtered_selection_delete_and_add_keep_visible_order(self):
+        self.app.filter_type = "enabled"
+        self.app._refresh_ui()
+        cards = self.app.task_cards.copy()
+        self.app.toggle_selected_task()
+        self.app.root.update_idletasks()
+        self.assertEqual(self.app.selected_task_id, "b")
+        self.assertFalse(self.app.task_cards["a"].grid_info())
+        self.assertIsNot(self.app.task_cards["b"], cards["b"])
+        self.assertIs(self.app.task_cards["c"], cards["c"])
+        self.assertEqual(self.app.summary_var.get(), "筛选 2/3 条")
+        hidden = self.app.task_cards["a"]
+        with patch.object(app_module, "ask_yes_no", return_value=True):
+            self.app.delete_selected_task()
+        self.app.root.update_idletasks()
+        self.assertNotIn("b", self.app.task_cards)
+        self.assertEqual(hidden.winfo_exists(), 1)
+        self.assertEqual(self.app.selected_task_id, "c")
+        added = Task(id="d", title="新增提醒", body="新增正文", trigger_type="weekly",
+                     trigger_config={"weekdays": [0], "hour": 8})
+        with patch.object(app_module, "TaskDialog", return_value=SimpleNamespace(result=added)), \
+             patch.object(self.app.root, "wait_window"):
+            self.app.add_task()
+        self.app.root.update_idletasks()
+        self.assertEqual(self.app.selected_task_id, "d")
+        self.assertEqual([int(self.app.task_cards[t].grid_info()["row"]) for t in ("c", "d")], [0, 1])
+        self.app.filter_type = "all"
+        self.app._set_filter_type("all")
+        self.app.root.update_idletasks()
+        self.assertEqual([int(self.app.task_cards[t].grid_info()["row"]) for t in ("a", "c", "d")], [0, 1, 2])
+
+    def test_pause_and_resume_update_every_card_and_no_change_is_reused(self):
+        self.app.tasks[2].enabled = False
+        self.app._refresh_ui()
+        for paused in (True, False):
+            with self.subTest(paused=paused):
+                self.app.scheduler.pause_all.side_effect = lambda: setattr(self.app.scheduler, "paused", True)
+                self.app.scheduler.resume_all.side_effect = lambda: setattr(self.app.scheduler, "paused", False)
+                with patch.object(self.app, "_render_task_card", wraps=self.app._render_task_card) as render:
+                    self.app.toggle_pause_all()
+                    self.app.root.update_idletasks()
+                    self.assertEqual(render.call_count, 3)
+                    for task_id in ("a", "b"):
+                        card = self.app.task_cards[task_id].content
+                        self.assertEqual(card.grid_slaves(row=0, column=3)[0].cget("text"),
+                                         "• 暂停" if paused else "• 启用")
+                        self.assertEqual(self._card_text(task_id, 2),
+                                         "下次：全部已暂停" if paused else "下次：暂无")
+                    self.assertEqual(self._card_text("c", 2), "下次：未启用")
+                    render.reset_mock()
+                    self.app._schedule_refresh()
+                    self.app.root.update_idletasks()
+                    render.assert_not_called()
+
+    def test_hidden_card_changes_are_current_when_shown_and_deleted_state_is_removed(self):
+        self.app._set_filter_type("all")
+        self.app.search_var.set("提醒 a")
+        self.app._run_search_filter()
+        self.app.root.update_idletasks()
+        hidden = self.app.task_cards["b"]
+        self.app.tasks[1].body = "隐藏期间的改后正文"
+        self.app._schedule_refresh()
+        self.app.root.update_idletasks()
+        self.assertIsNot(self.app.task_cards["b"], hidden)
+        self.assertFalse(self.app.task_cards["b"].grid_info())
+        self.app.search_var.set("")
+        self.app._run_search_filter()
+        self.app.root.update_idletasks()
+        self.assertEqual(self._card_text("b", 1), "隐藏期间的改后正文")
+        self.app.search_var.set("提醒 a")
+        self.app._run_search_filter()
+        self.app.root.update_idletasks()
+        removed = self.app.task_cards["b"]
+        self.app._save_task_change(self.app.tasks[1], delete=True)
+        self.app._schedule_refresh()
+        self.app.root.update_idletasks()
+        self.assertFalse(removed.winfo_exists())
+        self.assertNotIn("b", self.app.task_cards)
+        self.assertNotIn("b", self.app.task_dots)
+        self.assertNotIn("b", self.app._card_render_states)
+
+    def test_equivalent_replacement_reuses_card_and_click_edits_current_task(self):
+        cards = self.app.task_cards.copy()
+        original = self.app.tasks[1]
+        replacement = replace(original, sound=not original.sound)
+        self.app.tasks[1] = replacement
+        self.app._schedule_refresh()
+        self.app.root.update_idletasks()
+        self.assertEqual(self.app.task_cards, cards)
+        title = self.app.task_cards["b"].content.grid_slaves(row=0, column=2)[0]
+        with patch.object(app_module, "TaskDialog", return_value=SimpleNamespace(result=None)) as dialog, \
+             patch.object(self.app.root, "wait_window"):
+            script = title.bind("<Double-Button-1>")
+            command = script.split("[", 1)[1].split()[0]
+            self.app.root.tk.call(command, *(["0"] * 19))
+            self.assertIs(dialog.call_args.kwargs["task"], replacement)
+
+    def test_midnight_updates_relative_next_run_and_search_membership(self):
+        before = datetime(2026, 10, 14, 23, 59, 59)
+        after = before + timedelta(seconds=1)
+        self.app.tasks[0].next_run = "2026-10-15T09:00:00"
+        self.app.tasks[1].next_run = "2026-10-16T09:00:00"
+        with patch.object(app_module, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = before
+            self.app._display_day = before.date()
+            self.app._refresh_ui()
+            self.app.root.update_idletasks()
+            self.assertIn("明日", self._card_text("a", 2))
+            cards = self.app.task_cards.copy()
+            clock.now.return_value = after
+            self.app._refresh_clock()
+            self.app.root.update_idletasks()
+            self.assertIn("今日", self._card_text("a", 2))
+            self.assertIn("明日", self._card_text("b", 2))
+            self.assertIs(self.app.task_cards["c"], cards["c"])
+            self.app.search_var.set("今日")
+            self.app._run_search_filter()
+            self.app.root.update_idletasks()
+            self.assertEqual([t.id for t in self.app._visible_tasks()], ["a"])
+
+    def test_font_and_dpi_rebuild_reset_cached_render_states(self):
+        for family, ui_scale in (("Microsoft YaHei", self.app.ui_scale),
+                                 ("Microsoft YaHei", self.app.ui_scale * 1.25)):
+            with self.subTest(family=family, ui_scale=ui_scale):
+                cards = self.app.task_cards.copy()
+                self.app._card_render_states["deleted"] = ("stale",)
+                self.app.font_family_var.set(family)
+                self.app.ui_scale = ui_scale
+                self.app.root.ui_scale = ui_scale
+                self.app._rebuild_ui()
+                self.app.root.update_idletasks()
+                self.assertEqual(set(self.app._card_render_states), {"a", "b", "c"})
+                for task_id in cards:
+                    self.assertFalse(cards[task_id].winfo_exists())
+                    self.assertIsNot(self.app.task_cards[task_id], cards[task_id])
+                with patch.object(self.app, "_render_task_card", wraps=self.app._render_task_card) as render:
+                    self.app._schedule_refresh()
+                    self.app.root.update_idletasks()
+                    render.assert_not_called()
+
+    def test_in_place_trigger_and_priority_changes_refresh_only_the_affected_card(self):
+        self.app.tasks[0].body = ""
+        self.app._schedule_refresh()
+        self.app.root.update_idletasks()
+        for changes in ({"hour": 11}, {"weekdays": [2, 4]}):
+            with self.subTest(changes=changes):
+                cards = self.app.task_cards.copy()
+                self.app.tasks[0].trigger_config.update(changes)
+                self.app._schedule_refresh()
+                self.app.root.update_idletasks()
+                self.assertIsNot(self.app.task_cards["a"], cards["a"])
+                self.assertIs(self.app.task_cards["b"], cards["b"])
+                self.assertIs(self.app.task_cards["c"], cards["c"])
+                self.assertEqual(self._card_text("a", 1), self.app._describe_card_detail(self.app.tasks[0]))
+        cards = self.app.task_cards.copy()
+        self.app.tasks[0].trigger_type = "interval"
+        self.app.tasks[0].trigger_config = {"minutes": 5}
+        self.app.tasks[1].priority = "high"
+        self.app._schedule_refresh()
+        self.app.root.update_idletasks()
+        self.assertIsNot(self.app.task_cards["a"], cards["a"])
+        self.assertIsNot(self.app.task_cards["b"], cards["b"])
+        self.assertIs(self.app.task_cards["c"], cards["c"])
+        time_group = self.app.task_cards["a"].content.grid_slaves(row=0, column=0)[0].winfo_children()[0]
+        self.assertEqual([w.cget("text") for w in time_group.winfo_children()], ["5m", "固定间隔"])
 
 
 class PauseButtonTests(_RealAppTests):

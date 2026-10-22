@@ -481,9 +481,12 @@ class LiveInfoUITests(unittest.TestCase):
         self.addCleanup(self.destroy_window)
 
     def destroy_window(self):
-        for timer in self.app.root.tk.call("after", "info"):
-            self.app.root.after_cancel(timer)
-        self.app.root.destroy()
+        try:
+            for timer in self.app.root.tk.call("after", "info"):
+                # ttk 原生回调是 Tcl 脚本，Python 注册命令由 root.destroy 统一释放。
+                self.app.root.tk.call("after", "cancel", timer)
+        finally:
+            self.app.root.destroy()
 
     def wait_for(self, condition, timeout=3.0):
         deadline = time.monotonic() + timeout
@@ -923,6 +926,39 @@ class LiveInfoUITests(unittest.TestCase):
         self.assertEqual(self.app.season_card.grid_info()["row"], 0)
         self.assertEqual(self.app.home_divider.grid_info()["row"], 1)
         self.assertEqual(self.app.home_intro_content.grid_info()["row"], 2)
+
+
+class LiveInfoUICleanupTests(unittest.TestCase):
+    def test_cleanup_destroys_root_even_when_timer_cancellation_fails(self):
+        root = MagicMock()
+        root.tk.call.side_effect = [("after#0",), RuntimeError("取消定时器失败")]
+        root.after_cancel.side_effect = RuntimeError("取消定时器失败")
+        fixture = SimpleNamespace(app=SimpleNamespace(root=root))
+        with self.assertRaisesRegex(RuntimeError, "取消定时器失败"):
+            LiveInfoUITests.destroy_window(fixture)
+        root.destroy.assert_called_once_with()
+
+    def test_cleanup_cancels_native_and_python_timers_and_destroys_root(self):
+        root = app_module.tk.Tk()
+        root.withdraw()
+        python_timer = root.after(5000, lambda: None)
+        python_command = root.tk.call("after", "info", python_timer)[0]
+        native_timer = root.tk.call("after", 5000, ("set", "cleanup_probe", "done"))
+        self.assertIsInstance(native_timer, str)
+        self.assertIsInstance(root.tk.call("after", "info", native_timer)[0], tuple)
+        fixture = SimpleNamespace(app=SimpleNamespace(root=root))
+        try:
+            try:
+                LiveInfoUITests.destroy_window(fixture)
+            except TypeError as error:
+                self.fail(f"原生 Tcl 定时器不应阻断窗口清理：{error}")
+            self.assertEqual(root.tk.splitlist(root.tk.call("after", "info")), ())
+            self.assertEqual(root.tk.call("info", "commands", python_command), "")
+            self.assertTrue(root.tk.call("info", "commands", "set"))
+            self.assertIsNone(app_module.tk._default_root)
+        finally:
+            if app_module.tk._default_root is root:
+                root.destroy()
 
 
 if __name__ == "__main__":
